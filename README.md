@@ -105,6 +105,50 @@ rosbag play YOUR_DOWNLOADED.bag
 ```
 
 
-## 5. License
+## 5. Map Saving and Prior-Map Relocalization
+
+This fork extends FAST-LIVO2 with **map saving** and **prior-map based relocalization**, enabling the system to localize against a previously built map without mapping.
+
+### 5.1 Map Saving
+
+While running in mapping mode (`localization_en: false`), the voxel map and visual sparse map can be saved on exit or on demand via the `laserMapping/save_map` ROS service:
+
+```yaml
+pcd_save:
+  pcd_save_en: true      # save registered LiDAR point clouds
+  map_save_en: true      # save voxel map & visual sparse map (Log/pcd/)
+  type: 0                # 0: World Frame, 1: Body Frame
+  filter_size_pcd: 0.15  # downsample filter size [m]
+  interval: -1           # -1: all frames saved into ONE pcd file
+```
+
+```bash
+# Trigger map saving at any time (also saved automatically on exit):
+rosservice call /laserMapping/save_map
+# Map saved to Log/pcd/ (voxel_map.pcd, visual_map.pcd, etc.)
+```
+
+> **Note**: `Log/pcd/voxel_map.pcd` is **overwritten** by every save. Always copy the saved map to a separate file before using it as a prior map.
+
+### 5.2 Prior-Map Relocalization
+
+FAST-LIVO2 can localize against a previously saved map (no mapping update is performed, i.e. `Update Voxel Map` is disabled), using a prior-map guided initialization plus LIO tracking:
+
+1. Run a **mapping** session (`localization_en: false`) and save the map;
+2. Copy the saved map to a **separate** prior map file (e.g. `prior_map.pcd`);
+3. Enable localization mode and set `prior_map_path` to that file, then replay data from (approximately) the same start pose:
+
+```yaml
+localization:
+  localization_en: true
+  prior_map_path: "/path/to/prior_map.pcd"  # use a SEPARATE prior map file!
+  init_pos: [0.0, 0.0, 0.0]                 # initial position [m] in the prior-map frame
+  init_yaw: 0.0                             # initial yaw [rad]
+  sigma_num: 10.0                           # matching gate multiplier (wider than mapping's 3)
+```
+
+On startup, the prior map is loaded and voxelized (PCA plane fitting), and the initial pose is taken from `init_pos`/`init_yaw`. The system then performs direct LIO against the prior map with a widened matching gate (`sigma_num`) to tolerate initial pose error, without updating the voxel map.
+
+## 6. License
 
 The source code of this package is released under the [**GPLv2**](http://www.gnu.org/licenses/) license. For commercial use, please contact me at <zhengcr@connect.hku.hk> and Prof. Fu Zhang at <fuzhang@hku.hk> to discuss an alternative license.
