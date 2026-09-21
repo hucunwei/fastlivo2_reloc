@@ -41,11 +41,17 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   root_dir = ROOT_DIR;
   initializeFiles();
   initializeComponents();
+  save_map_srv_ = nh.advertiseService("laserMapping/save_map", &LIVMapper::saveMapCallback, this);
+  // Latched publisher for the prior map (published once in loadPriorMap, rviz can
+  // subscribe at any time afterwards)
+  prior_map_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/prior_map", 1, true);
+  // if (localization_en) { loadPriorMap(); }
   path.header.stamp = ros::Time::now();
   path.header.frame_id = "camera_init";
 }
 
 LIVMapper::~LIVMapper() {}
+
 
 void LIVMapper::readParameters(ros::NodeHandle &nh)
 {
@@ -96,6 +102,17 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
   nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
   nh.param<int>("pcd_save/type", pcd_save_type, 0);
+  nh.param<bool>("pcd_save/map_save_en", map_save_en, false);
+
+  nh.param<bool>("localization/localization_en", localization_en, false);
+  nh.param<string>("localization/prior_map_path", prior_map_path, "");
+  vector<double> init_pos_vec;
+  nh.param<vector<double>>("localization/init_pos", init_pos_vec, vector<double>());
+  if (init_pos_vec.size() == 3) { init_pos = V3D(init_pos_vec[0], init_pos_vec[1], init_pos_vec[2]); }
+  nh.param<double>("localization/init_yaw", init_yaw, 0.0);
+  double loc_sigma_num = 10.0;
+  nh.param<double>("localization/sigma_num", loc_sigma_num, 10.0);
+  localization_sigma_num = loc_sigma_num;
   nh.param<bool>("image_save/img_save_en", img_save_en, false);
   nh.param<int>("image_save/interval", img_save_interval, 1);
 
@@ -189,8 +206,14 @@ void LIVMapper::initializeFiles()
   fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
 }
 
-void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
+bool LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
 {
+    if (localization_en) { 
+
+      if(!loadPriorMap()) {
+       // return false;
+      }
+    }
   sub_pcl = p_pre->lidar_type == AVIA ? 
             nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this): 
             nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
@@ -214,6 +237,8 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
+
+  return true;
 }
 
 void LIVMapper::handleFirstFrame() 
@@ -421,13 +446,16 @@ void LIVMapper::handleLIO()
           (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
     voxelmap_manager->pv_list_[i].var = var;
   }
-  voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  if (!localization_en)
+  {
+    voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
+    std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  }
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
 
-  if(voxelmap_manager->config_setting_.map_sliding_en)
+  if(voxelmap_manager->config_setting_.map_sliding_en && !localization_en)
   {
     voxelmap_manager->mapSliding();
   }
@@ -531,6 +559,307 @@ void LIVMapper::savePCD()
   }
 }
 
+void LIVMapper::collectVoxelPoints(const VoxelOctoTree *octo, pcl::PointCloud<pcl::PointXYZINormal> &cloud)
+{
+  if (octo == nullptr) return;
+
+  // 1. Collect the plane center of each initialized voxel
+  //    (temp_points_ is cleared after plane init to save memory,
+  //     so the plane center is the proper representation of the map)
+  if (octo->plane_ptr_ != nullptr && octo->plane_ptr_->is_init_)
+  {
+    pcl::PointXYZINormal p;
+    p.x = octo->plane_ptr_->center_[0];
+    p.y = octo->plane_ptr_->center_[1];
+    p.z = octo->plane_ptr_->center_[2];
+    p.normal_x = octo->plane_ptr_->normal_[0];
+    p.normal_y = octo->plane_ptr_->normal_[1];
+    p.normal_z = octo->plane_ptr_->normal_[2];
+    p.intensity = 0;
+    cloud.push_back(p);
+  }
+
+  // 2. Recurse into children if this node is not a plane (same as GetUpdatePlane)
+  if (octo->layer_ < octo->max_layer_ && octo->plane_ptr_ != nullptr && !octo->plane_ptr_->is_plane_)
+  {
+    for (int i = 0; i < 8; i++)
+    {
+      if (octo->leaves_[i] != nullptr)
+      {
+        collectVoxelPoints(octo->leaves_[i], cloud);
+      }
+    }
+  }
+
+  // 3. Also collect remaining raw points (recently updated voxels not yet cleared)
+  for (size_t i = 0; i < octo->temp_points_.size(); i++)
+  {
+    pcl::PointXYZINormal p;
+    p.x = octo->temp_points_[i].point_w[0];
+    p.y = octo->temp_points_[i].point_w[1];
+    p.z = octo->temp_points_[i].point_w[2];
+    p.normal_x = octo->temp_points_[i].normal[0];
+    p.normal_y = octo->temp_points_[i].normal[1];
+    p.normal_z = octo->temp_points_[i].normal[2];
+    p.intensity = 0;
+    cloud.push_back(p);
+  }
+}
+
+void LIVMapper::saveMap()
+{
+  std::string save_dir = std::string(ROOT_DIR) + "Log/pcd/";
+  system(("mkdir -p " + save_dir).c_str());
+  pcl::PCDWriter pcd_writer;
+
+  /**************** Save LIO voxel map ****************/
+  // NOTE: the actual map lives in voxelmap_manager->voxel_map_ (the LIVMapper
+  // member "voxel_map" is only a stale copy made at construction time).
+  // The collected cloud contains one point (plane center + normal) per
+  // initialized voxel, which is already a compact map representation.
+  pcl::PointCloud<pcl::PointXYZINormal> voxel_cloud;
+  for (auto iter = voxelmap_manager->voxel_map_.begin(); iter != voxelmap_manager->voxel_map_.end(); iter++)
+  {
+    collectVoxelPoints(iter->second, voxel_cloud);
+  }
+  if (voxel_cloud.size() > 0)
+  {
+    std::string raw_dir = save_dir + "voxel_map.pcd";
+    pcd_writer.writeBinary(raw_dir, voxel_cloud);
+    std::cout << GREEN << "Voxel map saved to: " << raw_dir
+              << " with point count: " << voxel_cloud.points.size() << RESET << std::endl;
+  }
+  else
+  {
+    std::cout << "Voxel map is empty, nothing to save." << std::endl;
+  }
+
+  /**************** Save VIO visual sparse map ****************/
+  if (img_en && vio_manager)
+  {
+    pcl::PointCloud<pcl::PointXYZINormal> visual_cloud;
+    for (auto iter = vio_manager->feat_map.begin(); iter != vio_manager->feat_map.end(); iter++)
+    {
+      VOXEL_POINTS *vpoints = iter->second;
+      if (vpoints == nullptr) continue;
+      for (size_t i = 0; i < vpoints->voxel_points.size(); i++)
+      {
+        VisualPoint *vp = vpoints->voxel_points[i];
+        if (vp == nullptr) continue;
+        pcl::PointXYZINormal p;
+        p.x = vp->pos_[0];
+        p.y = vp->pos_[1];
+        p.z = vp->pos_[2];
+        p.normal_x = vp->normal_[0];
+        p.normal_y = vp->normal_[1];
+        p.normal_z = vp->normal_[2];
+        p.intensity = 0;
+        visual_cloud.push_back(p);
+      }
+    }
+    if (visual_cloud.size() > 0)
+    {
+      std::string visual_dir = save_dir + "visual_map.pcd";
+      pcd_writer.writeBinary(visual_dir, visual_cloud);
+      std::cout << GREEN << "Visual sparse map saved to: " << visual_dir
+                << " with point count: " << visual_cloud.points.size() << RESET << std::endl;
+    }
+    else
+    {
+      std::cout << "Visual sparse map is empty, nothing to save." << std::endl;
+    }
+  }
+
+  /**************** Save colored dense map (VIO-colored scans, same as rviz display) ****************/
+  if (img_en && pcl_wait_save->size() > 0)
+  {
+    std::string colored_dir = save_dir + "colored_map.pcd";
+    pcd_writer.writeBinary(colored_dir, *pcl_wait_save);
+    std::cout << GREEN << "Colored dense map saved to: " << colored_dir
+              << " with point count: " << pcl_wait_save->points.size() << RESET << std::endl;
+    PointCloudXYZRGB().swap(*pcl_wait_save);
+  }
+  else
+  {
+    std::cout << "Colored dense map is empty (no accumulated scans), nothing to save." << std::endl;
+  }
+}
+
+bool LIVMapper::saveMapCallback(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res)
+{
+  saveMap();
+  res.success = true;
+  res.message = "Map saved to " + std::string(ROOT_DIR) + "Log/pcd/";
+  return true;
+}
+
+bool LIVMapper::loadPriorMap()
+{
+  if (prior_map_path.empty())
+  {
+    ROS_ERROR("[Localization] localization_en is true but localization/prior_map_path is empty!");
+    // ros::shutdown();
+    return false;
+  }
+  pcl::PointCloud<pcl::PointXYZINormal>::Ptr prior_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
+  if (pcl::io::loadPCDFile(prior_map_path, *prior_cloud) < 0 || prior_cloud->empty())
+  {
+    ROS_ERROR("[Localization] Failed to load prior map: %s", prior_map_path.c_str());
+    ros::shutdown();
+    return false;
+  }
+  std::cout << GREEN << "[Localization] Loaded prior map: " << prior_map_path
+            << " with " << prior_cloud->size() << " points" << RESET << std::endl;
+
+  // Publish the prior map (latched) so rviz can display it
+  sensor_msgs::PointCloud2 prior_map_msg;
+  pcl::toROSMsg(*prior_cloud, prior_map_msg);
+  prior_map_msg.header.frame_id = "camera_init";
+  prior_map_msg.header.stamp = ros::Time::now();
+  prior_map_pub_.publish(prior_map_msg);
+  std::cout << GREEN << "[Localization] Prior map published on /prior_map for rviz" << RESET << std::endl;
+
+  // Widen the point-to-plane matching gate for localization: the initial pose
+  // against a prior map built by another run can be off by decimeters, and the
+  // small plane_var_ (strong EKF weights) would otherwise reject those matches.
+  if (localization_sigma_num > 0)
+  {
+    voxelmap_manager->config_setting_.sigma_num_ = localization_sigma_num;
+  }
+
+  float voxel_size = voxelmap_manager->config_setting_.max_voxel_size_;
+  int max_layer = voxelmap_manager->config_setting_.max_layer_;
+  int max_points_num = voxelmap_manager->config_setting_.max_points_num_;
+  float planer_threshold = voxelmap_manager->config_setting_.planner_threshold_;
+  std::vector<int> layer_init_num = voxelmap_manager->config_setting_.layer_init_num_;
+
+  // Insert prior points into voxels (same voxel assignment as BuildVoxelMap)
+  for (size_t i = 0; i < prior_cloud->size(); i++)
+  {
+    const pcl::PointXYZINormal &pt = prior_cloud->points[i];
+    pointWithVar pv;
+    pv.point_w << pt.x, pt.y, pt.z;
+    pv.normal << pt.normal_x, pt.normal_y, pt.normal_z;
+    // Small prior-point variance -> strong EKF measurement weights so the
+    // state is firmly pulled onto the fixed prior map (prevents slow divergence
+    // when localizing against a map built by a different run).
+    pv.var = 0.001 * Eigen::Matrix3d::Identity();
+    pv.var_nostate = 0.001 * Eigen::Matrix3d::Identity();
+    pv.body_var = 0.001 * Eigen::Matrix3d::Identity();
+
+    float loc_xyz[3];
+    for (int j = 0; j < 3; j++)
+    {
+      loc_xyz[j] = pv.point_w[j] / voxel_size;
+      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
+    }
+    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    auto iter = voxelmap_manager->voxel_map_.find(position);
+    if (iter != voxelmap_manager->voxel_map_.end())
+    {
+      iter->second->temp_points_.push_back(pv);
+    }
+    else
+    {
+      VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
+      voxelmap_manager->voxel_map_[position] = octo_tree;
+      octo_tree->quater_length_ = voxel_size / 4;
+      octo_tree->voxel_center_[0] = (0.5 + position.x) * voxel_size;
+      octo_tree->voxel_center_[1] = (0.5 + position.y) * voxel_size;
+      octo_tree->voxel_center_[2] = (0.5 + position.z) * voxel_size;
+      octo_tree->temp_points_.push_back(pv);
+      octo_tree->layer_init_num_ = layer_init_num;
+    }
+  }
+
+  // Initialize planes for each voxel
+  int pca_planes = 0, manual_planes = 0, skipped = 0;
+  for (auto iter = voxelmap_manager->voxel_map_.begin(); iter != voxelmap_manager->voxel_map_.end(); ++iter)
+  {
+    VoxelOctoTree *octo = iter->second;
+    if (octo->temp_points_.empty()) { skipped++; continue; }
+    if (octo->temp_points_.size() > (size_t)layer_init_num[0])
+    {
+      // Dense prior map: normal PCA plane initialization (and octree cutting)
+      octo->init_octo_tree();
+      octo->update_enable_ = false;
+      pca_planes++;
+    }
+    else if (octo->temp_points_.size() >= 3)
+    {
+      // A few points: PCA plane directly
+      octo->init_plane(octo->temp_points_, octo->plane_ptr_);
+      octo->init_octo_ = true;
+      octo->new_points_ = 0;
+      octo->update_enable_ = false;
+      pca_planes++;
+    }
+    else
+    {
+      // Sparse prior map (e.g. saved voxel_map.pcd: 1 point per voxel with normal):
+      // manually build the plane from the point position and its saved normal
+      const pointWithVar &pv0 = octo->temp_points_[0];
+      VoxelPlane *plane = octo->plane_ptr_;
+      if (pv0.normal.norm() < 0.5)
+      {
+        // no valid normal saved -> cannot build a plane
+        skipped++;
+        continue;
+      }
+      plane->center_ = pv0.point_w;
+      plane->normal_ = pv0.normal.normalized();
+      plane->d_ = -plane->normal_.dot(plane->center_);
+      plane->points_size_ = octo->temp_points_.size();
+      plane->is_plane_ = true;
+      plane->is_init_ = true;
+      // A single point has no extent: use the voxel half-diagonal as the plane
+      // radius so that build_single_residual's range gate can accept matches.
+      plane->radius_ = 0.5 * sqrt(3.0f) * voxel_size;
+      plane->plane_var_ = 0.01 * Eigen::Matrix<double, 6, 6>::Identity();
+      octo->init_octo_ = true;
+      octo->new_points_ = 0;
+      octo->update_enable_ = false;
+      manual_planes++;
+    }
+  }
+  lidar_map_inited = true;
+
+  // Sanity check: distance from the initial pose to the nearest prior map point.
+  // A large value means localization/prior_map_path's frame does not match the
+  // current run's start pose and init_pos/init_yaw must be set accordingly.
+  {
+    double min_dist = 1e9;
+    size_t step = std::max<size_t>(1, prior_cloud->size() / 20000);
+    for (size_t i = 0; i < prior_cloud->size(); i += step)
+    {
+      double dx = prior_cloud->points[i].x - init_pos[0];
+      double dy = prior_cloud->points[i].y - init_pos[1];
+      double dz = prior_cloud->points[i].z - init_pos[2];
+      min_dist = std::min(min_dist, sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    std::cout << (min_dist > 5.0 ? YELLOW : GREEN)
+              << "[Localization] Nearest prior-map point to the initial pose: " << min_dist << " m"
+              << (min_dist > 5.0 ? "  (WARNING: initial pose looks wrong, set localization/init_pos & init_yaw!)" : "")
+              << RESET << std::endl;
+  }
+
+  // Initial pose: map origin by default (configurable via localization/init_pos & init_yaw)
+  _state.pos_end = init_pos;
+  _state.rot_end = Eigen::AngleAxisd(init_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  state_propagat = _state;
+  // Inflate the initial covariance so the EKF can make large corrections while
+  // converging onto the prior map (the initial pose is only a rough guess).
+  _state.cov.block<3, 3>(0, 0) *= 10;
+  _state.cov.block<3, 3>(3, 3) *= 10;
+
+  std::cout << GREEN << "[Localization] Prior map ready: " << voxelmap_manager->voxel_map_.size()
+            << " voxels (PCA planes: " << pca_planes << ", manual planes: " << manual_planes
+            << ", skipped: " << skipped << "). Initial pos: " << init_pos.transpose()
+            << ", yaw: " << init_yaw << RESET << std::endl;
+
+  return true;
+}
+
 void LIVMapper::run() 
 {
   ros::Rate rate(5000);
@@ -551,6 +880,7 @@ void LIVMapper::run()
     stateEstimationAndMapping();
   }
   savePCD();
+  if (map_save_en) saveMap();
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -1200,7 +1530,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   std::stringstream ss_time;
   ss_time << std::fixed << std::setprecision(6) << update_time;
 
-  if (pcd_save_en)
+  if (pcd_save_en || map_save_en)
   {
     static int scan_wait_num = 0;
 

@@ -88,6 +88,7 @@ evo:
 
 pcd_save:
   pcd_save_en: false
+  map_save_en: false # Save voxel map & visual sparse map on exit (or via /laserMapping/save_map service)
   type: 0 # 0: World Frame, 1: Body Frame;
   colmap_output_en: false # need to set interval = -1
   filter_size_pcd: 0.15

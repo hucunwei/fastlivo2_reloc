@@ -8,5 +8,6 @@ int main(int argc, char **argv)
   LIVMapper mapper(nh); 
   mapper.initializeSubscribersAndPublishers(nh, it);
   mapper.run();
+  
   return 0;
 }

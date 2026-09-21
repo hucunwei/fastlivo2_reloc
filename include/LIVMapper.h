@@ -19,6 +19,7 @@ which is included as part of this source code package.
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
+#include <std_srvs/Trigger.h>
 #include <vikit/camera_loader.h>
 
 class LIVMapper
@@ -26,7 +27,7 @@ class LIVMapper
 public:
   LIVMapper(ros::NodeHandle &nh);
   ~LIVMapper();
-  void initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it);
+  bool initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it);
   void initializeComponents();
   void initializeFiles();
   void run();
@@ -36,6 +37,10 @@ public:
   void handleVIO();
   void handleLIO();
   void savePCD();
+  void saveMap();
+  void collectVoxelPoints(const VoxelOctoTree *octo, pcl::PointCloud<pcl::PointXYZINormal> &cloud);
+  bool saveMapCallback(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res);
+  bool loadPriorMap();
   void processImu();
   
   bool sync_packages(LidarMeasureGroup &meas);
@@ -183,5 +188,15 @@ public:
   double aver_time_icp = 0;
   double aver_time_map_inre = 0;
   bool colmap_output_en = false;
+  bool map_save_en = false;
+  ros::ServiceServer save_map_srv_;
+
+  // Prior-map localization (no mapping) mode
+  bool localization_en = false;
+  std::string prior_map_path;
+  ros::Publisher prior_map_pub_;
+  V3D init_pos{0, 0, 0};
+  double init_yaw = 0.0;
+  double localization_sigma_num = 10.0;
 };
 #endif

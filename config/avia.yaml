@@ -76,8 +76,20 @@ evo:
   seq_name: "CBD_Building_01"
   pose_output_en: false
 
+# # Prior-map localization (no mapping) mode.
+# # Workflow: 1) run mapping (localization_en: false) and save the map;
+# 2) copy the saved map to a SEPARATE file as the prior map;
+# 3) set localization_en: true and prior_map_path to that file to localize.
+localization:
+  localization_en: true
+  prior_map_path: "/home/hucunwei/study/fastlivo2/src/FAST-LIVO2/Log/pcd/prior_map_fullbag.pcd"   # use a SEPARATE prior map file, NOT Log/pcd/voxel_map.pcd (it gets overwritten by every save!)   
+  init_pos: [0.0, 0.0, 0.0]
+  init_yaw: 0.0        # radians
+  sigma_num: 10.0      # matching gate multiplier (wider than mapping's 3 to tolerate initial pose error)
+
 pcd_save:
   pcd_save_en: false
+  map_save_en: false # Save voxel map & visual sparse map on exit (or via /laserMapping/save_map service)
   type: 0 # 0: World Frame, 1: Body Frame;
   colmap_output_en: false # need to set interval = -1
   filter_size_pcd: 0.15

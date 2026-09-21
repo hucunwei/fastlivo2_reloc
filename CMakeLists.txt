@@ -77,6 +77,7 @@ endif()
 
 # Find catkin and required dependencies
 find_package(catkin REQUIRED COMPONENTS
+  std_srvs
   geometry_msgs
   nav_msgs
   sensor_msgs
@@ -95,6 +96,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
+set(OpenCV_DIR /usr/lib/x86_64-linux-gnu/cmake/opencv4)
 find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
