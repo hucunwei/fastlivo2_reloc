@@ -15,9 +15,11 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 #include "feature.h"
+#include <deque>
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
 #include <set>
+#include <unordered_map>
 #include <vikit/math_utils.h>
 #include <vikit/robust_cost.h>
 #include <vikit/vision.h>
@@ -126,6 +128,13 @@ public:
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> feat_map;
   unordered_map<VOXEL_LOCATION, int> sub_feat_map; 
   unordered_map<int, Warp *> warp_map;
+  // Reference images are required for photometric warp. Keeping every frame
+  // (1224x1024) for a multi-minute bag exhausts RAM, so only a recent window is kept.
+  std::deque<int> frame_image_ids_;
+  std::unordered_map<int, cv::Mat> frame_images_;
+  cv::Mat empty_frame_image_;
+  static constexpr int kMaxVisualPointsPerVoxel = 20;
+  static constexpr int kMaxRefImages = 200;
   vector<VisualPoint *> retrieve_voxel_points;
   vector<pointWithVar> append_voxel_points;
   FramePtr new_frame_;
@@ -160,7 +169,12 @@ public:
                                      const V3D &xyz_ref, const V3D &normal_ref, const SE3 &T_cur_ref, const int level_ref, Matrix2d &A_cur_ref);
   void warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref, const Vector2d &px_ref, const int level_ref, const int search_level,
                   const int pyramid_level, const int halfpatch_size, float *patch);
-  void insertPointIntoVoxelMap(VisualPoint *pt_new);
+  bool insertPointIntoVoxelMap(VisualPoint *pt_new);
+  void slideVisualMap();
+  void rememberFrameImage(int frame_id, const cv::Mat &img);
+  bool hasFrameImage(int frame_id) const;
+  const cv::Mat &frameImage(int frame_id) const;
+  bool pointHasFrameImage(const VisualPoint *pt) const;
   void plotTrackedPoints();
   void updateFrameState(StatesGroup state);
   void projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);

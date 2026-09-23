@@ -39,7 +39,7 @@ Panels:
   - Class: rviz/Time
     Name: Time
     SyncMode: 0
-    SyncSource: PriorMap
+    SyncSource: surround
 Preferences:
   PromptSaveOnExit: true
 Toolbars:
@@ -96,7 +96,7 @@ Visualization Manager:
           Position Transformer: XYZ
           Queue Size: 1
           Selectable: false
-          Size (Pixels): 4
+          Size (Pixels): 2
           Size (m): 0.009999999776482582
           Style: Points
           Topic: /cloud_registered
@@ -115,8 +115,8 @@ Visualization Manager:
           Class: rviz/PointCloud2
           Color: 238; 238; 236
           Color Transformer: RGB8
-          Decay Time: 10000
-          Enabled: false
+          Decay Time: 1000
+          Enabled: true
           Invert Rainbow: false
           Max Color: 255; 255; 255
           Max Intensity: 159
@@ -124,16 +124,16 @@ Visualization Manager:
           Min Intensity: 5
           Name: surround
           Position Transformer: XYZ
-          Queue Size: 10
+          Queue Size: 1
           Selectable: false
-          Size (Pixels): 2
+          Size (Pixels): 1
           Size (m): 0.004999999888241291
           Style: Points
           Topic: /cloud_registered
           Unreliable: true
           Use Fixed Frame: true
           Use rainbow: true
-          Value: false
+          Value: true
         - Alpha: 1
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
@@ -574,7 +574,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/ThirdPersonFollower
-      Distance: 29.97995948791504
+      Distance: 49.989990234375
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -582,17 +582,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -60.65005111694336
-        Y: 34.64976501464844
-        Z: -3.527626540744677e-05
+        X: -31.891883850097656
+        Y: -18.50375747680664
+        Z: -4.6386223402805626e-05
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.7647968530654907
+      Pitch: 0.7497969269752502
       Target Frame: drone
-      Yaw: 0.0936017856001854
+      Yaw: 3.4217824935913086
     Saved:
       - Class: rviz/Orbit
         Distance: 117.53474426269531

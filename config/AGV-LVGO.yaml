@@ -60,8 +60,8 @@ lio:
   layer_init_num: [5, 5, 5, 5, 5]
 
 local_map:  
-  map_sliding_en: false
-  half_map_size: 100
+  map_sliding_en: true
+  half_map_size: 100   # voxels; with lio/voxel_size 2 m this keeps about +/-200 m
   sliding_thresh: 8
 
 uav:
@@ -69,7 +69,7 @@ uav:
   gravity_align_en: false
 
 publish:
-  dense_map_en: true
+  dense_map_en: false
   pub_effect_point_en: false 
   pub_plane_en: false
   pub_scan_num: 1
@@ -79,13 +79,32 @@ evo:
   seq_name: "Grass01"
   pose_output_en: true
 
+# # Prior-map localization (no mapping) mode.
+# # Workflow: 1) run mapping (localization_en: false) and save the map;
+# 2) copy the saved map to a SEPARATE file as the prior map;
+# 3) set localization_en: true and prior_map_path to that file to localize.
+localization:
+  localization_en: false
+  prior_map_path: "/home/hucunwei/study/fastlivo2/src/FAST-LIVO2/Log/pcd/agv-lvgo/after_optimization_downsampled_01.pcd"   # use a SEPARATE prior map file, NOT Log/pcd/voxel_map.pcd (it gets overwritten by every save!)   
+  init_pos: [0.0, 0.0, 0.0]
+  init_yaw: 0.0        # radians; NOTE: auto-overridden by Log/pcd/init_map_pose.txt (saved during mapping/optimization)
+  sigma_num: 10.0      # matching gate multiplier (wider than mapping's 3 to tolerate initial pose error)
+  # When localization_en is true, the system reads Log/pcd/init_map_pose.txt
+  # (map_origin_lat map_origin_lon map_origin_alt yaw_rad) generated during the
+  # mapping/optimization run. It overrides init_yaw with the saved heading and
+  # uses lat/lon/alt as the RTK->ENU conversion origin so the localization frame
+  # matches the optimized prior map exactly.
+
 pcd_save:
-  pcd_save_en: false
+  pcd_save_en: true
+  map_save_en: true # Save voxel map & visual sparse map on exit (or via /laserMapping/save_map service)
+  type: 0 # 0: World Frame, 1: Body Frame;
   colmap_output_en: false # need to set interval = -1
   filter_size_pcd: 0.15
   interval: -1
   # how many LiDAR frames saved in each pcd file;
   # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+
 
 gps:
   gps_en: true
@@ -95,7 +114,10 @@ gps:
   gps_topic: "/ublox_driver/receiver_pvt"
 
 opt:
+  opt_enable: true
   load_data: false
   rtk_cov: 0.05
   livo2_RPY_cov: 0.00000001
   livo2_XYZ_cov: 0.0001
+  smoother_lag: 10.0      # fixed-lag window [s]; older keyframes are marginalized
+  align_duration: 50.0    # RTK/SLAM alignment uses the first this many seconds

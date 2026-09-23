@@ -7,6 +7,7 @@
 #include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/BatchFixedLagSmoother.h>
 #include <gtsam/nonlinear/Marginals.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/inference/Symbol.h>
@@ -27,7 +28,9 @@
 #include <GeographicLib/LocalCartesian.hpp> 
 #include <Eigen/StdVector>
 #include <atomic>
+#include <fstream>
 #include <memory>
+#include <unordered_set>
 #include "LIVMapper.h"
 #include "FastDTW/example.hpp"
 
@@ -88,7 +91,21 @@ public:
 
     void loadData(const std::string& data_dir);
     void offlineOptimizationTask();
-    void initialAlign();
+    bool initialAlign();
+    bool ensureWindowAligned(bool force);
+    void feedAvailable(gtsam::Values& previous_estimate);
+    bool feedFixedLagKey(size_t index, gtsam::Values& previous_estimate);
+    void commitKey(size_t index, const gtsam::Pose3& antenna_pose);
+    void finalizeSlidingWindow(const gtsam::Values& window_estimate);
+    gtsam::Pose3 antennaPoseFromSlam(const gtsam::Pose3& slam_imu) const;
+    bool lookupRtkPosition(double t, gtsam::Point3& p) const;
+    void trimGpsQueue();
+    void appendTumPose(double time, const gtsam::Pose3& imu_pose);
+    void appendCommittedCloud(const PointCloudXYZRGB::Ptr& cloud, const gtsam::Pose3& imu_pose);
+    bool ensureMapStream();
+    void flushMapHeader(bool close_stream);
+    void writeInitMapPose(double time, const gtsam::Pose3& imu_pose);
+    void saveCommittedGlobalMap();
     double calculateDtwTimeOffset(const std::vector<std::vector<double>>& gpsdata, const std::vector<std::vector<double>>& slamdata);
     double estimateVelocityTimeOffset(const std::vector<std::vector<double>>& gps_position_data,
                                       const std::vector<std::vector<double>>& slam_position_data,
@@ -105,6 +122,7 @@ public:
                                double time,
                                const Eigen::Vector3d& velocity,
                                const PointCloudXYZRGB::Ptr& cloud);
+    bool keyframeMotionEnough(const gtsam::Pose3 &pose) const;
     void syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, const sensor_msgs::PointCloud2::ConstPtr& cloudMsg);
     void gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& pvtMsg);
     // void gpsHandler(const sensor_msgs::NavSatFixConstPtr& gpsMsg);
@@ -140,6 +158,32 @@ public:
     gtsam::Values initialEstimate;        
     gtsam::Values isamCurrentEstimate;
     gtsam::Values optimizedEstimate;
+
+    // Fixed-lag smoother. Only the recent smoother_lag_ seconds stay in the graph.
+    // Older poses are marginalized and their clouds are released.
+    std::unique_ptr<gtsam::BatchFixedLagSmoother> fixed_lag_smoother_;
+    double smoother_lag_ = 10.0;
+    double align_duration_ = 50.0;
+    double last_align_attempt_wall_ = -1.0;
+    double last_smoother_stamp_ = -1.0e300;
+    size_t fed_count_ = 0;
+    bool odom_only_ = false;
+    bool smoother_failed_ = false;
+    bool window_finalized_ = false;
+    bool gps_time_shift_applied_ = false;
+    double gps_time_shift_ = 0.0;
+    gtsam::Pose3 T_enu_slam_ = gtsam::Pose3::Identity();
+    gtsam::Pose3 last_odometry_antenna_ = gtsam::Pose3::Identity();
+    bool have_last_odometry_antenna_ = false;
+    std::vector<char> key_committed_;
+    PointCloudXYZRGB::Ptr optimized_map_;
+    std::unordered_set<MapVoxelKey, MapVoxelKeyHash> optimized_voxels_;
+    std::ofstream tum_stream_;
+    std::fstream map_stream_;
+    std::streamoff map_width_pos_ = 0;
+    std::streamoff map_points_pos_ = 0;
+    size_t map_points_written_ = 0;
+    int map_commits_since_flush_ = 0;
     
     gtsam::Pose3 T_imu_rtk;
 

@@ -30,7 +30,7 @@ preprocess:
 vio:
   max_iterations: 5
   outlier_threshold: 1000 # 78 100 156 #100 200 500 700 infinite
-  img_point_cov: 1000 # 100 1000 
+  img_point_cov: 100 # 100 1000 
   patch_size: 8
   patch_pyrimid_level: 4
   normal_en: true
@@ -84,7 +84,7 @@ evo:
 # 2) copy the saved map to a SEPARATE file as the prior map;
 # 3) set localization_en: true and prior_map_path to that file to localize.
 localization:
-  localization_en: true
+  localization_en: false
   prior_map_path: "/home/hucunwei/study/fastlivo2/src/FAST-LIVO2/Log/pcd/hh-lvgo-01/after_optimization_downsampled_01.pcd"   # use a SEPARATE prior map file, NOT Log/pcd/voxel_map.pcd (it gets overwritten by every save!)   
   init_pos: [0.0, 0.0, 0.0]
   init_yaw: 0.0        # radians; NOTE: auto-overridden by Log/pcd/init_map_pose.txt (saved during mapping/optimization)
@@ -119,4 +119,6 @@ opt:
   rtk_cov: 0.01
   livo2_RPY_cov: 0.00000001
   livo2_XYZ_cov: 0.001
-  map_voxel_size: 0.10   # voxel leaf size [m] for the downsampled map saved on Enter (press Enter to trigger optimization)
+  map_voxel_size: 0.10   # voxel leaf size [m] for the map committed by the sliding-window smoother
+  smoother_lag: 10.0     # fixed-lag window [s]; older keyframes are marginalized
+  align_duration: 50.0   # RTK/SLAM alignment uses the first this many seconds

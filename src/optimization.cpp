@@ -3,14 +3,11 @@
 #include <pcl/filters/approximate_voxel_grid.h>
 
 #include <algorithm>
-#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <numeric>
-
-#include <sys/select.h>
-#include <unistd.h>
 
 namespace {
 struct VelocitySeries
@@ -71,46 +68,6 @@ bool interpolateLinear(const VelocitySeries& series, double t, double& value)
     const double a = (t - t0) / (t1 - t0);
     value = series.values[i - 1] * (1.0 - a) + series.values[i] * a;
     return true;
-}
-
-bool waitForOptimizationTrigger(const std::atomic_bool& shutdown_requested)
-{
-    while (ros::ok() && !shutdown_requested.load(std::memory_order_relaxed)) {
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(STDIN_FILENO, &read_set);
-
-        timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
-
-        const int rc = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ROS_WARN("[Offline Optimization] stdin wait failed, falling back to auto-trigger (waits for keyframe buffer idle).");
-            return true;
-        }
-
-        if (rc == 0 || !FD_ISSET(STDIN_FILENO, &read_set)) {
-            continue;
-        }
-
-        char ch = '\0';
-        const ssize_t nread = read(STDIN_FILENO, &ch, 1);
-        if (nread <= 0) {
-            // stdin unavailable (e.g. launched by roslaunch in background): auto-trigger
-            // after keyframe buffer goes idle (handled by waitForKeyFrameIdle downstream).
-            ROS_INFO("[Offline Optimization] stdin unavailable, auto-trigger enabled: optimization starts once keyframe buffer is idle.");
-            return true;
-        }
-        if (ch == '\n') {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 void smoothVelocitySeries(VelocitySeries& series)
@@ -371,6 +328,11 @@ optimization::optimization(ros::NodeHandle &nh)
     nh.param<double>("opt/livo2_RPY_cov", livo2_RPY_cov, 1e-4);
     nh.param<double>("opt/livo2_XYZ_cov", livo2_XYZ_cov, 1e-4);
     nh.param<double>("opt/map_voxel_size", map_voxel_size_, 0.10);
+    nh.param<double>("opt/smoother_lag", smoother_lag_, 10.0);
+    nh.param<double>("opt/align_duration", align_duration_, 50.0);
+    if (smoother_lag_ < 0.5) smoother_lag_ = 0.5;
+    if (align_duration_ < 5.0) align_duration_ = 5.0;
+    optimized_map_.reset(new PointCloudXYZRGB());
 
     // subGPS = nh.subscribe<sensor_msgs::NavSatFix>(gps_topic, 2000, &optimization::gpsHandler, this);
     subGPS_pvt = nh.subscribe<gnss_comm::GnssPVTSolnMsg>(gps_topic, 2000, &optimization::gpsHandler, this);
@@ -381,8 +343,8 @@ optimization::optimization(ros::NodeHandle &nh)
     gps_lever_arm_(2) = gps_extrinT[2]; 
     T_imu_rtk = gtsam::Pose3(gtsam::Rot3(), gtsam::Point3(gps_lever_arm_));
 
-    subOdom_.subscribe(nh, "/odometry/fast_livo2", 2000);
-    subCloud_.subscribe(nh, "/synced_cloud", 2000);
+    subOdom_.subscribe(nh, "/odometry/fast_livo2", 200);
+    subCloud_.subscribe(nh, "/synced_cloud", 20);
     sync_ = std::make_unique<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(10), subOdom_, subCloud_);
     sync_->registerCallback(boost::bind(&optimization::syncedCallback, this, _1, _2));
 
@@ -394,7 +356,8 @@ optimization::optimization(ros::NodeHandle &nh)
     }
     last_keyframe_wall_time_ = ros::WallTime::now();
 
-    ROS_INFO("Optimization mode: [OFFLINE]. Accumulating factors for batch optimization.");
+    ROS_INFO("Optimization mode: [SLIDING WINDOW]. lag=%.1f s, align=%.1f s.",
+             smoother_lag_, align_duration_);
     optimization_thread_ = std::thread(&optimization::offlineOptimizationTask, this);
     
 }
@@ -407,98 +370,417 @@ optimization::~optimization()
     }
 }
 
-//Optimize threads
-void optimization::offlineOptimizationTask() {
-    if (!waitForOptimizationTrigger(optimization_shutdown_requested_)) {
-        return;
+namespace {
+bool bufferIdle(const ros::WallTime& last_message_time, size_t keyframe_count, double idle_seconds)
+{
+    if (keyframe_count == 0) return false;
+    return (ros::WallTime::now() - last_message_time).toSec() >= idle_seconds;
+}
+} // namespace
+
+void optimization::offlineOptimizationTask()
+{
+    gtsam::Values previous_estimate;
+    while (ros::ok() && !optimization_shutdown_requested_.load(std::memory_order_relaxed)) {
+        const bool ready = ensureWindowAligned(false);
+        if (ready) {
+            feedAvailable(previous_estimate);
+        }
+
+        bool idle = false;
+        bool caught_up = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            idle = bufferIdle(last_keyframe_wall_time_, keyFrames.size(), 3.0);
+            caught_up = fed_count_ >= keyFrames.size();
+        }
+        if (idle && caught_up) {
+            if (ensureWindowAligned(true)) {
+                feedAvailable(previous_estimate);
+            }
+            finalizeSlidingWindow(previous_estimate);
+            break;
+        }
+        ros::WallDuration(0.05).sleep();
     }
 
-    waitForKeyFrameIdle(3.0);
+    // Exit commits only poses already in the smoother. Feeding the leftover
+    // keyframe backlog here blocks shutdown until the whole trajectory is optimized.
+    if (!window_finalized_) {
+        finalizeSlidingWindow(previous_estimate);
+    }
+}
+
+bool optimization::ensureWindowAligned(bool force)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    if (map_frame_aligned_ || odom_only_) return true;
+    if (keyFrames.size() < 3 || gpsQueue.empty()) {
+        if (force && !keyFrames.empty()) {
+            odom_only_ = true;
+            ROS_WARN("[SlidingWindow] not enough data to align, using odometry-only window.");
+            return true;
+        }
+        return false;
+    }
+
+    const double span = keyFrames.back().time - keyFrames.front().time;
+    if (!force && span < align_duration_) return false;
+    const double now = ros::WallTime::now().toSec();
+    if (!force && last_align_attempt_wall_ >= 0.0 && (now - last_align_attempt_wall_) < 2.0) {
+        return false;
+    }
+    last_align_attempt_wall_ = now;
+
+    if (initialAlign()) {
+        trimGpsQueue();
+        ROS_INFO("[SlidingWindow] alignment ready, feeding keyframes into a %.1f s window.", smoother_lag_);
+        return true;
+    }
+    if (force || span >= 2.0 * align_duration_) {
+        odom_only_ = true;
+        ROS_WARN("[SlidingWindow] alignment failed, falling back to odometry-only window.");
+        return true;
+    }
+    ROS_WARN("[SlidingWindow] alignment failed, will retry.");
+    return false;
+}
+
+gtsam::Pose3 optimization::antennaPoseFromSlam(const gtsam::Pose3& slam_imu) const
+{
+    const gtsam::Pose3 antenna_in_slam = slam_imu.compose(T_imu_rtk);
+    if (map_frame_aligned_) {
+        return T_enu_slam_.compose(antenna_in_slam);
+    }
+    return antenna_in_slam;
+}
+
+bool optimization::lookupRtkPosition(double t, gtsam::Point3& p) const
+{
+    if (gpsQueue.size() < 2) return false;
+
+    const auto earlier = [](const nav_msgs::Odometry& msg, double time) {
+        return msg.header.stamp.toSec() < time;
+    };
+    auto upper = std::lower_bound(gpsQueue.begin(), gpsQueue.end(), t, earlier);
+
+    auto assign = [&p](const nav_msgs::Odometry& msg) {
+        p = gtsam::Point3(msg.pose.pose.position.x,
+                          msg.pose.pose.position.y,
+                          msg.pose.pose.position.z);
+    };
+    if (upper == gpsQueue.begin()) {
+        if (std::fabs(upper->header.stamp.toSec() - t) > 0.2) return false;
+        assign(*upper);
+        return true;
+    }
+    if (upper == gpsQueue.end()) {
+        --upper;
+        if (std::fabs(upper->header.stamp.toSec() - t) > 0.2) return false;
+        assign(*upper);
+        return true;
+    }
+
+    const auto lower = std::prev(upper);
+    const double t0 = lower->header.stamp.toSec();
+    const double t1 = upper->header.stamp.toSec();
+    if ((t1 - t0) > 1.0 || (t1 - t0) <= 1e-9) return false;
+    const double a = (t - t0) / (t1 - t0);
+    const gtsam::Point3 p0(lower->pose.pose.position.x, lower->pose.pose.position.y, lower->pose.pose.position.z);
+    const gtsam::Point3 p1(upper->pose.pose.position.x, upper->pose.pose.position.y, upper->pose.pose.position.z);
+    p = gtsam::Point3((1.0 - a) * p0.x() + a * p1.x(),
+                      (1.0 - a) * p0.y() + a * p1.y(),
+                      (1.0 - a) * p0.z() + a * p1.z());
+    return true;
+}
+
+void optimization::trimGpsQueue()
+{
+    if (gpsQueue.size() < 2) return;
+    const double tmin = gpsQueue.back().header.stamp.toSec() - (smoother_lag_ + 5.0);
+    while (gpsQueue.size() > 2 && gpsQueue.front().header.stamp.toSec() < tmin) {
+        gpsQueue.pop_front();
+    }
+}
+
+void optimization::feedAvailable(gtsam::Values& previous_estimate)
+{
+    while (ros::ok() && !optimization_shutdown_requested_.load(std::memory_order_relaxed)) {
+        size_t available = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            available = keyFrames.size();
+        }
+        if (fed_count_ >= available) return;
+        if (!feedFixedLagKey(fed_count_, previous_estimate)) return;
+        ++fed_count_;
+        if (fed_count_ % 50 == 0) {
+            ROS_INFO("[SlidingWindow] fed %zu keyframes.", fed_count_);
+        }
+    }
+}
+
+bool optimization::feedFixedLagKey(size_t index, gtsam::Values& previous_estimate)
+{
+    double time = 0.0;
+    gtsam::Pose3 slam_pose = gtsam::Pose3::Identity();
+    bool have_rtk = false;
+    gtsam::Point3 rtk_position;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (index >= keyFrames.size()) return false;
+        time = keyFrames[index].time;
+        slam_pose = keyFrames[index].pose;
+        if (map_frame_aligned_) {
+            have_rtk = lookupRtkPosition(time, rtk_position);
+        }
+    }
+
+    if (time <= last_smoother_stamp_) {
+        time = last_smoother_stamp_ + 1e-4;
+    }
+    last_smoother_stamp_ = time;
+
+    const gtsam::Pose3 antenna = antennaPoseFromSlam(slam_pose);
+    if (smoother_failed_) {
+        commitKey(index, antenna);
+        return true;
+    }
+
+    if (!fixed_lag_smoother_) {
+        gtsam::LevenbergMarquardtParams params;
+        // Serial solver: GTSAM's TBB build corrupts the heap when mixed with ROS/PCL.
+        params.linearSolverType = gtsam::LevenbergMarquardtParams::SEQUENTIAL_CHOLESKY;
+        params.setMaxIterations(20);
+        params.setRelativeErrorTol(1e-5);
+        params.setAbsoluteErrorTol(1e-5);
+        fixed_lag_smoother_.reset(new gtsam::BatchFixedLagSmoother(smoother_lag_, params, true));
+        ROS_INFO("rtk_cov, livo2_RPY_cov, livo2_XYZ_cov: %f, %f, %f",
+                 rtk_cov, livo2_RPY_cov, livo2_XYZ_cov);
+    }
+
+    gtsam::NonlinearFactorGraph graph;
+    gtsam::Values values;
+    values.insert(static_cast<gtsam::Key>(index), antenna);
+
+    const auto prior_noise = gtsam::noiseModel::Diagonal::Variances(
+        (gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6).finished());
+    const auto odometry_noise = gtsam::noiseModel::Diagonal::Variances(
+        (gtsam::Vector(6) << livo2_RPY_cov, livo2_RPY_cov, livo2_RPY_cov,
+                             livo2_XYZ_cov, livo2_XYZ_cov, livo2_XYZ_cov).finished());
+    const auto gps_noise = gtsam::noiseModel::Diagonal::Variances(
+        (gtsam::Vector(3) << rtk_cov, rtk_cov, 1.0).finished());
+
+    if (!have_last_odometry_antenna_) {
+        graph.add(gtsam::PriorFactor<gtsam::Pose3>(static_cast<gtsam::Key>(index), antenna, prior_noise));
+    } else {
+        const gtsam::Pose3 relative = last_odometry_antenna_.between(antenna);
+        graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            static_cast<gtsam::Key>(index - 1), static_cast<gtsam::Key>(index), relative, odometry_noise));
+    }
+    if (have_rtk) {
+        graph.add(gtsam::GPSFactor(static_cast<gtsam::Key>(index), rtk_position, gps_noise));
+    }
+    last_odometry_antenna_ = antenna;
+    have_last_odometry_antenna_ = true;
+
+    gtsam::FixedLagSmoother::KeyTimestampMap stamps;
+    stamps[static_cast<gtsam::Key>(index)] = time;
+
+    try {
+        fixed_lag_smoother_->update(graph, values, stamps);
+        const gtsam::Values current = fixed_lag_smoother_->calculateEstimate();
+        for (const auto& key_value : previous_estimate) {
+            if (!current.exists(key_value.key)) {
+                commitKey(static_cast<size_t>(key_value.key),
+                          previous_estimate.at<gtsam::Pose3>(key_value.key));
+            }
+        }
+        previous_estimate = current;
+    } catch (const std::exception& e) {
+        smoother_failed_ = true;
+        ROS_ERROR("[SlidingWindow] update failed at key %zu: %s. Later keyframes keep the odometry pose.",
+                  index, e.what());
+        commitKey(index, antenna);
+    }
+    return true;
+}
+
+void optimization::commitKey(size_t index, const gtsam::Pose3& antenna_pose)
+{
+    PointCloudXYZRGB::Ptr cloud;
+    double time = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (index < key_committed_.size() && key_committed_[index]) return;
+        if (index >= keyFrames.size()) return;
+        cloud = keyFrames[index].cloud;
+        time = keyFrames[index].time;
+    }
+
+    const gtsam::Pose3 imu_pose = antenna_pose.compose(T_imu_rtk.inverse());
+    appendTumPose(time, imu_pose);
+    if (index == 0) {
+        writeInitMapPose(time, imu_pose);
+    }
+    appendCommittedCloud(cloud, imu_pose);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (index >= key_committed_.size()) {
+            key_committed_.resize(index + 1, 0);
+        }
+        key_committed_[index] = 1;
+        keyFrames[index].cloud.reset();
+    }
+    if (++map_commits_since_flush_ >= 20) {
+        flushMapHeader(false);
+        map_commits_since_flush_ = 0;
+    }
+}
+
+void optimization::finalizeSlidingWindow(const gtsam::Values& window_estimate)
+{
+    if (window_finalized_) return;
+    window_finalized_ = true;
     {
         std::lock_guard<std::mutex> lock(mutex);
         accepting_keyframes_ = false;
     }
-    std::cout << "[Offline Optimization] Starting batch optimization..." << std::endl;
-    initialAlign();
-    std::cout << "[Offline Optimization] Initial alignment done." << std::endl;
-    writeTumTrajectory(livo_tum_before_output_path_);
-    saveOptimizedGlobalMap();
-    std::cout << "[Offline Optimization] Initial global map and tum saved." << std::endl;
-    
-    gtsam::LevenbergMarquardtParams params;
-    // Use serial solver to avoid TBB multithread heap corruption (double free)
-    // when GTSAM is built with TBB and mixed with ROS/PCL allocators.
-    // Set the enum directly: the string translator does not accept "SEQ_QR".
-    params.linearSolverType = gtsam::LevenbergMarquardtParams::SEQUENTIAL_CHOLESKY;
 
-    params.setMaxIterations(500);
-    params.setRelativeErrorTol(1e-9);
-    params.setAbsoluteErrorTol(1e-9);
-    
-    std::cout << "[Offline Optimization] Building batch graph... (keyframes: " << initialEstimate.size() << ", gpsQueue_B: " << gpsQueue_B.size() << ", gpsQueue: " << gpsQueue.size() << ")" << std::endl;
-    buildBatchGraph();
-    std::cout << "[Offline Optimization] Graph built with " << gtSAMgraph.size() << " factors. Starting LM optimization..." << std::endl;
-    gtsam::LevenbergMarquardtOptimizer optimizer(gtSAMgraph, initialEstimate, params);
-    gtsam::Values result = optimizer.optimize();
-    std::cout << "[Offline Optimization] LM optimization finished." << std::endl;
-    initialEstimate = result;
-    std::cout << "[Offline Optimization] First optimization pass done." <<  std::endl;
+    for (const auto& key_value : window_estimate) {
+        commitKey(static_cast<size_t>(key_value.key),
+                  window_estimate.at<gtsam::Pose3>(key_value.key));
+    }
 
+    if (tum_stream_.is_open()) {
+        tum_stream_.close();
+    }
     is_optimized = true;
-    int numPoses = initialEstimate.size();
+    saveCommittedGlobalMap();
+    ROS_INFO("[SlidingWindow] finished. Committed %zu keyframes, map has %zu points.",
+             fed_count_, map_points_written_);
+}
 
-    for (int i = 0; i < numPoses; ++i) {
-        gtsam::Pose3 rtk_optimizedPose = initialEstimate.at<gtsam::Pose3>(i);
-        keyFrames[i].pose = rtk_optimizedPose;
-    }
-
-    writeOptimizedTumTrajectory();
-    std::cout << "[Offline Optimization] Optimized TUM trajectory saved "  << std::endl;
-    writeRtkTumTrajectory();
-    std::cout << "[Offline Optimization] RTK TUM trajectory saved " << std::endl;
-
-    for (int i = 0; i < numPoses; ++i) {
-        gtsam::Pose3 rtk_optimizedPose = initialEstimate.at<gtsam::Pose3>(i);
-        gtsam::Pose3 imu_optimizedPose = rtk_optimizedPose.compose((T_imu_rtk).inverse());
-        keyFrames[i].pose = imu_optimizedPose;
-    }
-
-    // The map is built from these IMU poses. Persist the first one so localization
-    // starts in the same ENU frame. eulerAngles yaw from the alignment rotation is
-    // not the vehicle heading.
-    if (map_frame_aligned_ && !keyFrames.empty()) {
-        const gtsam::Pose3 &pose0 = keyFrames.front().pose;
-        const gtsam::Point3 t = pose0.translation();
-        const gtsam::Quaternion q = pose0.rotation().toQuaternion();
-        const double yaw = std::atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
-                                       1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
-        const std::string init_map_pose_path = std::string(ROOT_DIR) + "Log/pcd/init_map_pose.txt";
-        std::ofstream f(init_map_pose_path.c_str());
-        if (f.is_open()) {
-            f << "# map_origin_lat map_origin_lon map_origin_alt yaw_rad\n";
-            f << std::fixed << std::setprecision(12)
-              << map_origin_lat_ << " " << map_origin_lon_ << " "
-              << map_origin_alt_ << " " << yaw << "\n";
-            f << "# init_pose time tx ty tz qx qy qz qw\n";
-            f << std::setprecision(9)
-              << keyFrames.front().time << " "
-              << t.x() << " " << t.y() << " " << t.z() << " "
-              << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
-            f.close();
-            ROS_INFO("[Offline Optimization] Saved init pose to %s (pos=%.3f %.3f %.3f yaw=%.6f rad)",
-                     init_map_pose_path.c_str(), t.x(), t.y(), t.z(), yaw);
-        } else {
-            ROS_WARN("[Offline Optimization] Failed to write init_map_pose.txt: %s",
-                     init_map_pose_path.c_str());
+void optimization::appendTumPose(double time, const gtsam::Pose3& imu_pose)
+{
+    if (opt_tum_output_path_.empty()) return;
+    if (!tum_stream_.is_open()) {
+        tum_stream_.open(opt_tum_output_path_.c_str());
+        if (!tum_stream_.is_open()) {
+            ROS_WARN("[SlidingWindow] failed to open %s", opt_tum_output_path_.c_str());
+            return;
         }
+        tum_stream_ << "# timestamp tx ty tz qx qy qz qw\n";
+        tum_stream_ << std::fixed << std::setprecision(6);
+    }
+    const auto& t = imu_pose.translation();
+    const auto q = imu_pose.rotation().toQuaternion();
+    tum_stream_ << time << " "
+                << t.x() << " " << t.y() << " " << t.z() << " "
+                << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+}
+
+bool optimization::ensureMapStream()
+{
+    if (map_stream_.is_open()) return true;
+    const std::string path = global_map_pcd_path_ + "after_optimization_downsampled.pcd";
+    map_stream_.open(path.c_str(), std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!map_stream_.is_open()) {
+        ROS_WARN("[SlidingWindow] failed to open %s", path.c_str());
+        return false;
     }
 
-    std::cout << "[Offline Optimization] Saving maps and trajectories..." << std::endl;
-    //savekeyframescan();
-    saveOptimizedGlobalMap();
-    std::cout << "[Offline Optimization] Global map saved " << std::endl;
+    std::string header;
+    header += "# .PCD v0.7 - Point Cloud Data file format\n";
+    header += "VERSION 0.7\n";
+    header += "FIELDS x y z rgb\n";
+    header += "SIZE 4 4 4 4\n";
+    header += "TYPE F F F F\n";
+    header += "COUNT 1 1 1 1\n";
+    header += "WIDTH ";
+    map_width_pos_ = static_cast<std::streamoff>(header.size());
+    header += "0000000000\n";
+    header += "HEIGHT 1\n";
+    header += "VIEWPOINT 0 0 0 1 0 0 0\n";
+    header += "POINTS ";
+    map_points_pos_ = static_cast<std::streamoff>(header.size());
+    header += "0000000000\n";
+    header += "DATA binary\n";
+    map_stream_.write(header.data(), static_cast<std::streamsize>(header.size()));
+    map_points_written_ = 0;
+    return map_stream_.good();
+}
 
-    std::cout << "[Offline Optimization] Finished." << std::endl;
+void optimization::appendCommittedCloud(const PointCloudXYZRGB::Ptr& cloud, const gtsam::Pose3& imu_pose)
+{
+    if (!cloud || cloud->empty()) return;
+    if (!ensureMapStream()) return;
+    PointCloudXYZRGB transformed;
+    pcl::transformPointCloud(*cloud, transformed, poseToAffine3f(imu_pose));
+    for (const auto& pt : transformed.points) {
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+        const float record[4] = {pt.x, pt.y, pt.z, pt.rgb};
+        map_stream_.write(reinterpret_cast<const char*>(record), sizeof(record));
+        ++map_points_written_;
+    }
+}
+
+void optimization::writeInitMapPose(double time, const gtsam::Pose3& imu_pose)
+{
+    const gtsam::Point3 t = imu_pose.translation();
+    const gtsam::Quaternion q = imu_pose.rotation().toQuaternion();
+    const double yaw = std::atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
+                                   1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+    const std::string path = std::string(ROOT_DIR) + "Log/pcd/init_map_pose.txt";
+    std::ofstream f(path.c_str());
+    if (!f.is_open()) {
+        ROS_WARN("[SlidingWindow] failed to write %s", path.c_str());
+        return;
+    }
+    f << "# map_origin_lat map_origin_lon map_origin_alt yaw_rad\n";
+    f << std::fixed << std::setprecision(12)
+      << map_origin_lat_ << " " << map_origin_lon_ << " "
+      << map_origin_alt_ << " " << yaw << "\n";
+    f << "# init_pose time tx ty tz qx qy qz qw\n";
+    f << std::setprecision(9)
+      << time << " "
+      << t.x() << " " << t.y() << " " << t.z() << " "
+      << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    ROS_INFO("[SlidingWindow] saved init pose to %s (pos=%.3f %.3f %.3f yaw=%.6f rad)",
+             path.c_str(), t.x(), t.y(), t.z(), yaw);
+}
+
+void optimization::flushMapHeader(bool close_stream)
+{
+    if (!map_stream_.is_open()) {
+        if (close_stream) {
+            ROS_WARN("[SlidingWindow] no committed points to save.");
+        }
+        return;
+    }
+    char digits[16];
+    std::snprintf(digits, sizeof(digits), "%010zu", map_points_written_);
+    const auto end_pos = map_stream_.tellp();
+    map_stream_.seekp(map_width_pos_);
+    map_stream_.write(digits, 10);
+    map_stream_.seekp(map_points_pos_);
+    map_stream_.write(digits, 10);
+    if (!close_stream) {
+        map_stream_.seekp(end_pos);
+    }
+    map_stream_.flush();
+    map_commits_since_flush_ = 0;
+    if (!close_stream) return;
+    map_stream_.close();
+    std::cout << "[SlidingWindow] Saved map (" << map_points_written_
+              << " points) to " << global_map_pcd_path_
+              << "after_optimization_downsampled.pcd" << std::endl;
+}
+
+void optimization::saveCommittedGlobalMap()
+{
+    flushMapHeader(true);
 }
 
 void optimization::waitForKeyFrameIdle(double idle_seconds)
@@ -527,6 +809,15 @@ void optimization::waitForKeyFrameIdle(double idle_seconds)
         }
         ros::WallDuration(0.5).sleep();
     }
+}
+
+bool optimization::keyframeMotionEnough(const gtsam::Pose3 &pose) const
+{
+    if (keyFrames.empty()) return true;
+    const gtsam::Pose3 delta = keyFrames.back().pose.between(pose);
+    if (delta.translation().norm() >= 0.5) return true;
+    const double angle = gtsam::Rot3::Logmap(delta.rotation()).norm();
+    return angle >= 5.0 * M_PI / 180.0;
 }
 
 void optimization::saveKeyFrameAndFactor(const gtsam::Pose3& pose,
@@ -563,6 +854,25 @@ void optimization::saveKeyFrameAndFactor(const gtsam::Pose3& pose,
     }
 
     keyFrames.push_back(keyframe);
+    // Pose-graph clouds are only needed until the fixed-lag window commits them.
+    // If optimization falls behind, drop the oldest scans instead of growing RAM.
+    constexpr size_t kMaxCachedKeyframeClouds = 80;
+    size_t cached = 0;
+    for (const auto& frame : keyFrames) {
+        if (frame.cloud && !frame.cloud->empty()) ++cached;
+    }
+    if (cached > kMaxCachedKeyframeClouds) {
+        size_t extra = cached - kMaxCachedKeyframeClouds;
+        for (auto& frame : keyFrames) {
+            if (extra == 0) break;
+            if (frame.cloud && !frame.cloud->empty()) {
+                frame.cloud.reset();
+                --extra;
+            }
+        }
+        ROS_WARN_THROTTLE(5.0, "[SlidingWindow] keyframe cloud cache capped at %zu scans.",
+                          kMaxCachedKeyframeClouds);
+    }
     last_keyframe_wall_time_ = ros::WallTime::now();
 }
 
@@ -789,7 +1099,7 @@ double optimization::estimateVelocityTimeOffset(
 }
 
 //Spacetime synchronization
-void optimization::initialAlign()
+bool optimization::initialAlign()
 {
     //using spline
     std::cout << " [initialAlign] initial align (using Spline)... " << std::endl;
@@ -797,7 +1107,7 @@ void optimization::initialAlign()
 
     if (keyFrames.empty() || gpsQueue.empty()) {
         ROS_WARN("[initialAlign] empty buffers.");
-        return;
+        return false;
     }
 
     std::vector<std::vector<double>> slam_position_data;
@@ -857,10 +1167,14 @@ void optimization::initialAlign()
         }
     }
 
-    if (std::fabs(applied_time_offset) > 1e-9) {
-        const ros::Duration time_offset(applied_time_offset);
-        for (auto& g : gpsQueue) {
-            g.header.stamp += time_offset;
+    if (!gps_time_shift_applied_) {
+        gps_time_shift_ = applied_time_offset;
+        gps_time_shift_applied_ = true;
+        if (std::fabs(applied_time_offset) > 1e-9) {
+            const ros::Duration time_offset(applied_time_offset);
+            for (auto& g : gpsQueue) {
+                g.header.stamp += time_offset;
+            }
         }
     }
 
@@ -931,7 +1245,7 @@ void optimization::initialAlign()
     
     if (T.size() < 2) {
         ROS_WARN("[initialAlign] not enough RTK samples for spline.");
-        return;
+        return false;
     }
 
     auto buildSpline = [](const std::vector<double>& t,
@@ -1007,7 +1321,7 @@ void optimization::initialAlign()
     std::vector<double> Mx, My, Mz;
     if (!buildSpline(T, X, Mx) || !buildSpline(T, Y, My) || !buildSpline(T, Z, Mz)) {
         ROS_WARN("[initialAlign] spline build failed.");
-        return;
+        return false;
     }
 
     auto find_nearest_gps = [&](double t_query) -> const nav_msgs::Odometry* {
@@ -1088,42 +1402,19 @@ void optimization::initialAlign()
 
     if (A_slam_gps.size() < 3) {
         ROS_WARN("[initialAlign] too few spline pairs to align.");
-        return;
+        return false;
     }
 
-    gtsam::Pose3 T_enu_slam = computeSVD(B_enu_gps, A_slam_gps);
-
-    // Save the map origin (lat/lon/alt) and the SLAM->ENU alignment yaw so the
-    // localization stage can restore the exact ENU frame and initial heading.
-    {
-        Eigen::Matrix3d R = T_enu_slam.rotation().matrix();
-        double yaw = R.eulerAngles(2, 1, 0)[0];  // ZYX order: yaw around Z, radians
-        std::string init_map_pose_path = std::string(ROOT_DIR) + "Log/pcd/init_map_pose.txt";
-        std::ofstream f(init_map_pose_path.c_str());
-        if (f.is_open()) {
-            f << "# map_origin_lat map_origin_lon map_origin_alt yaw_rad\n";
-            f << std::fixed << std::setprecision(12)
-              << map_origin_lat_ << " " << map_origin_lon_ << " "
-              << map_origin_alt_ << " " << yaw << "\n";
-            f.close();
-            ROS_INFO("[initialAlign] Saved map origin + yaw to %s (lat=%.9f lon=%.9f alt=%.3f yaw=%.6f rad)",
-                     init_map_pose_path.c_str(), map_origin_lat_, map_origin_lon_, map_origin_alt_, yaw);
-        } else {
-            ROS_WARN("[initialAlign] Failed to write init_map_pose.txt: %s", init_map_pose_path.c_str());
-        }
-    }
-
-    for (size_t i = 0; i < keyFrames.size(); ++i) {
-        gtsam::Pose3 T_slam_imu = initialEstimate.at<gtsam::Pose3>(i);
-        gtsam::Pose3 T_slam_gps = T_slam_imu.compose(T_imu_rtk);
-        gtsam::Pose3 T_enu_gps = T_enu_slam.compose(T_slam_gps);
-
-        initialEstimate.update(i, T_enu_gps);
-        keyFrames[i].pose = T_enu_gps;
-    }
-
+    T_enu_slam_ = computeSVD(B_enu_gps, A_slam_gps);
     map_frame_aligned_ = true;
+
+    // Keyframe poses stay in the SLAM IMU frame so the motion gate can keep
+    // comparing them. ENU antenna poses are built when each frame is fed.
+    if (!keyFrames.empty()) {
+        writeInitMapPose(keyFrames.front().time, T_enu_slam_.compose(keyFrames.front().pose));
+    }
     ROS_INFO("[initialAlign] Spline-based alignment complete.");
+    return true;
 }
 
 //build gtsam graph
@@ -1194,6 +1485,14 @@ void optimization::syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, c
     const auto& velocity_msg = odomMsg->twist.twist.linear;
     Eigen::Vector3d velocity(velocity_msg.x, velocity_msg.y, velocity_msg.z);
 
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        // Touch the idle clock on every frame. A stopped vehicle must not look
+        // like the bag has ended, or offline optimization starts mid-run.
+        last_keyframe_wall_time_ = ros::WallTime::now();
+        if (!accepting_keyframes_ || !keyframeMotionEnough(pose)) return;
+    }
+
     PointCloudXYZRGB::Ptr cloud(new PointCloudXYZRGB());
     pcl::fromROSMsg(*cloudMsg, *cloud);
 
@@ -1245,8 +1544,17 @@ void optimization::gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
     gps_odom.pose.covariance[7]  = gpsMsg->h_acc; 
     gps_odom.pose.covariance[14] = gpsMsg->v_acc; 
 
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (std::fabs(gps_time_shift_) > 1e-9) {
+            gps_odom.header.stamp += ros::Duration(gps_time_shift_);
+        }
+        gpsQueue.push_back(gps_odom);
+        if (map_frame_aligned_) {
+            trimGpsQueue();
+        }
+    }
     pubGpsOdom.publish(gps_odom);
-    gpsQueue.push_back(gps_odom);
 }
 
 void optimization::savekeyframescan()

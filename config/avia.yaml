@@ -81,7 +81,7 @@ evo:
 # 2) copy the saved map to a SEPARATE file as the prior map;
 # 3) set localization_en: true and prior_map_path to that file to localize.
 localization:
-  localization_en: true
+  localization_en: false
   prior_map_path: "/home/hucunwei/study/fastlivo2/src/FAST-LIVO2/Log/pcd/retail_street/all_downsampled_points.pcd"   # use a SEPARATE prior map file, NOT Log/pcd/voxel_map.pcd (it gets overwritten by every save!)   
   init_pos: [0.0, 0.0, 0.0]
   init_yaw: 0.0        # radians

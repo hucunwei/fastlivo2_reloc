@@ -24,7 +24,31 @@ which is included as part of this source code package.
 #include <gnss_comm/GnssPVTSolnMsg.h>
 #include <GeographicLib/LocalCartesian.hpp>
 #include <vikit/camera_loader.h>
+#include <fstream>
+#include <unordered_set>
 #include <vector>
+
+struct MapVoxelKey
+{
+  int x;
+  int y;
+  int z;
+  bool operator==(const MapVoxelKey &other) const
+  {
+    return x == other.x && y == other.y && z == other.z;
+  }
+};
+
+struct MapVoxelKeyHash
+{
+  size_t operator()(const MapVoxelKey &key) const
+  {
+    size_t h = static_cast<size_t>(key.x) * 73856093u;
+    h ^= static_cast<size_t>(key.y) * 19349663u;
+    h ^= static_cast<size_t>(key.z) * 83492791u;
+    return h;
+  }
+};
 
 class LIVMapper
 {
@@ -43,6 +67,12 @@ public:
   void handleRTK();
   void savePCD();
   void mergeCloudChunks();
+  bool ensureOnlineMapStream(bool rgb);
+  void appendOnlineMapCloud(const PointCloudXYZRGB::Ptr &cloud);
+  void appendOnlineMapCloud(const PointCloudXYZI::Ptr &cloud);
+  void flushOnlineMapHeader(bool close_stream);
+  void appendUniqueMapCloud(const PointCloudXYZRGB::Ptr &cloud);
+  void appendUniqueMapCloud(const PointCloudXYZI::Ptr &cloud);
   void saveMap();
   void collectVoxelPoints(const VoxelOctoTree *octo, pcl::PointCloud<pcl::PointXYZINormal> &cloud);
   bool saveMapCallback(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res);
@@ -156,6 +186,16 @@ public:
   // Per-frame clouds kept until exit. Avoids copying the whole map on every scan.
   std::vector<PointCloudXYZRGB::Ptr> cloud_chunks_;
   std::vector<PointCloudXYZI::Ptr> cloud_chunks_intensity_;
+  // One point per voxel for the map saved at exit. Overlapping scans do not stack.
+  std::unordered_set<MapVoxelKey, MapVoxelKeyHash> saved_rgb_voxels_;
+  std::unordered_set<MapVoxelKey, MapVoxelKeyHash> saved_intensity_voxels_;
+  // interval < 0 streams the downsampled map here instead of keeping it in RAM.
+  std::fstream online_map_stream_;
+  std::string online_map_pcd_path_;
+  std::streamoff online_map_width_pos_ = 0;
+  std::streamoff online_map_points_pos_ = 0;
+  size_t online_map_points_written_ = 0;
+  int online_map_frames_since_flush_ = 0;
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 

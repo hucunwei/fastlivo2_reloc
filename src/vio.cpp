@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "vio.h"
+#include <cmath>
 
 VIOManager::VIOManager()
 {
@@ -224,7 +225,40 @@ void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
   }
 }
 
-void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
+void VIOManager::rememberFrameImage(int frame_id, const cv::Mat &img)
+{
+  if (img.empty() || frame_images_.find(frame_id) != frame_images_.end()) return;
+  frame_images_.emplace(frame_id, img);
+  frame_image_ids_.push_back(frame_id);
+  while (static_cast<int>(frame_image_ids_.size()) > kMaxRefImages)
+  {
+    const int old_id = frame_image_ids_.front();
+    frame_image_ids_.pop_front();
+    frame_images_.erase(old_id);
+  }
+}
+
+bool VIOManager::hasFrameImage(int frame_id) const
+{
+  return frame_images_.find(frame_id) != frame_images_.end();
+}
+
+const cv::Mat &VIOManager::frameImage(int frame_id) const
+{
+  auto it = frame_images_.find(frame_id);
+  if (it == frame_images_.end()) return empty_frame_image_;
+  return it->second;
+}
+
+bool VIOManager::pointHasFrameImage(const VisualPoint *pt) const
+{
+  if (pt == nullptr) return false;
+  const Feature *ref = (pt->has_ref_patch_ && pt->ref_patch) ? pt->ref_patch
+                       : (pt->obs_.empty() ? nullptr : pt->obs_.front());
+  return ref != nullptr && hasFrameImage(ref->id_);
+}
+
+bool VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
 {
   V3D pt_w(pt_new->pos_[0], pt_new->pos_[1], pt_new->pos_[2]);
   double voxel_size = 0.5;
@@ -238,7 +272,28 @@ void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
   auto iter = feat_map.find(position);
   if (iter != feat_map.end())
   {
-    iter->second->voxel_points.push_back(pt_new);
+    auto &points = iter->second->voxel_points;
+    if (static_cast<int>(points.size()) >= kMaxVisualPointsPerVoxel)
+    {
+      auto dead = points.end();
+      for (auto it = points.begin(); it != points.end(); ++it)
+      {
+        if (!pointHasFrameImage(*it))
+        {
+          dead = it;
+          break;
+        }
+      }
+      if (dead == points.end())
+      {
+        delete pt_new;
+        return false;
+      }
+      delete *dead;
+      *dead = pt_new;
+      return true;
+    }
+    points.push_back(pt_new);
     iter->second->count++;
   }
   else
@@ -246,6 +301,40 @@ void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
     VOXEL_POINTS *ot = new VOXEL_POINTS(0);
     ot->voxel_points.push_back(pt_new);
     feat_map[position] = ot;
+  }
+  return true;
+}
+
+void VIOManager::slideVisualMap()
+{
+  if (state == nullptr || feat_map.empty()) return;
+  // Photometric tracking only uses the recent reference-image window, so visual
+  // points far behind the vehicle are never matched again.
+  constexpr double kVisualMapRadius = 80.0;
+  constexpr double kVoxelSize = 0.5;
+  const double radius_sq = kVisualMapRadius * kVisualMapRadius;
+  const V3D &pos = state->pos_end;
+  size_t removed = 0;
+  for (auto it = feat_map.begin(); it != feat_map.end();)
+  {
+    const double cx = (static_cast<double>(it->first.x) + 0.5) * kVoxelSize;
+    const double cy = (static_cast<double>(it->first.y) + 0.5) * kVoxelSize;
+    const double cz = (static_cast<double>(it->first.z) + 0.5) * kVoxelSize;
+    const double dx = cx - pos[0];
+    const double dy = cy - pos[1];
+    const double dz = cz - pos[2];
+    if (dx * dx + dy * dy + dz * dz <= radius_sq)
+    {
+      ++it;
+      continue;
+    }
+    delete it->second;
+    it = feat_map.erase(it);
+    ++removed;
+  }
+  if (removed > 0)
+  {
+    printf("[ VIO ] slid visual map, removed %zu voxels, %zu remain\n", removed, feat_map.size());
   }
 }
 
@@ -696,6 +785,23 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         if (!pt->getCloseViewObs(new_frame_->pos(), ref_ftr, pc)) continue;
       }
 
+      if (!hasFrameImage(ref_ftr->id_))
+      {
+        Feature *alive = nullptr;
+        for (Feature *ftr : pt->obs_)
+        {
+          if (hasFrameImage(ftr->id_))
+          {
+            alive = ftr;
+            break;
+          }
+        }
+        if (alive == nullptr) continue;
+        ref_ftr = alive;
+        pt->ref_patch = alive;
+        pt->has_ref_patch_ = true;
+      }
+
       if (normal_en)
       {
         V3D norm_vec = (ref_ftr->T_f_w_.rotation_matrix() * pt->normal_).normalized();
@@ -736,9 +842,11 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
       // t_1 = omp_get_wtime();
 
+      const cv::Mat &ref_img = frameImage(ref_ftr->id_);
+      if (ref_img.empty()) continue;
       for (int pyramid_level = 0; pyramid_level <= patch_pyrimid_level - 1; pyramid_level++)
       {
-        warpAffine(A_cur_ref_zero, ref_ftr->img_, ref_ftr->px_, ref_ftr->level_, search_level, pyramid_level, patch_size_half, patch_wrap.data());
+        warpAffine(A_cur_ref_zero, ref_img, ref_ftr->px_, ref_ftr->level_, search_level, pyramid_level, patch_size_half, patch_wrap.data());
       }
 
       getImagePatch(img, pc, patch_buffer.data(), 0);
@@ -804,6 +912,14 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
 void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
 {
   if (pg.size() <= 10) return;
+
+  // Parked frames keep projecting the same surfaces into new visual points.
+  const double horizontal_speed = std::hypot(state->vel_end(0), state->vel_end(1));
+  if (!feat_map.empty() && horizontal_speed < 0.3)
+  {
+    printf("[ VIO ] Skip new visual map points, horizontal speed %.2f m/s\n", horizontal_speed);
+    return;
+  }
 
   // double t0 = omp_get_wtime();
   for (int i = 0; i < pg.size(); i++)
@@ -878,7 +994,6 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
 
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt_new, patch, pc, f, new_frame_->T_f_w_, 0);
-      ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
 
@@ -891,8 +1006,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       
       pt_new->previous_normal_ = pt_new->normal_;
 
-      insertPointIntoVoxelMap(pt_new);
-      add += 1;
+      if (insertPointIntoVoxelMap(pt_new)) add += 1;
       // map_cur_frame.push_back(pt_new);
     }
   }
@@ -957,7 +1071,6 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       update_flag[i] = 1;
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt, patch_temp, pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
-      ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
       pt->addFrameRef(ftr_new);
@@ -1143,7 +1256,7 @@ void VIOManager::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, Vo
 
       // norm_vec << norm_vec(1), norm_vec(0), norm_vec(2);
       cv::Mat img_cur = new_frame_->img_;
-      cv::Mat img_ref = ref_ftr->img_;
+      cv::Mat img_ref = frameImage(ref_ftr->id_);
 
       SE3 T_cur_ref = new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse();
       Matrix2d A_cur_ref;
@@ -1282,7 +1395,7 @@ void VIOManager::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, Vo
     if (D > 3) continue;
 
     cv::Mat img_cur = new_frame_->img_;
-    cv::Mat img_ref = ref_ftr->img_;
+    cv::Mat img_ref = frameImage(ref_ftr->id_);
     for (int y = 0; y < patch_size; ++y)
     {
       for (int x = 0; x < patch_size; ++x) //, ++patch_ptr)
@@ -1343,9 +1456,9 @@ void VIOManager::precomputeReferencePatches(int level)
     const int scale = (1 << level);
 
     VisualPoint *pt = visual_submap->voxel_points[i];
-    cv::Mat img = pt->ref_patch->img_;
-
-    if (pt == nullptr) continue;
+    if (pt == nullptr || pt->ref_patch == nullptr) continue;
+    cv::Mat img = frameImage(pt->ref_patch->id_);
+    if (img.empty()) continue;
 
     double depth((pt->pos_ - pt->ref_patch->pos()).norm());
     V3D pf = pt->ref_patch->f_ * depth;
@@ -1797,6 +1910,7 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   if (img.channels() == 3) cv::cvtColor(img, img, CV_BGR2GRAY);
 
   new_frame_.reset(new Frame(cam, img));
+  rememberFrameImage(new_frame_->id_, img);
   updateFrameState(*state);
   
   resetGrid();
@@ -1826,6 +1940,7 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   double t6 = omp_get_wtime();
 
   updateReferencePatch(feat_map);
+  slideVisualMap();
 
   double t7 = omp_get_wtime();
   

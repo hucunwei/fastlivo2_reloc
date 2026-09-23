@@ -13,6 +13,8 @@ which is included as part of this source code package.
 #include "LIVMapper.h"
 #include <gnss_comm/GnssPVTSolnMsg.h>
 #include <GeographicLib/LocalCartesian.hpp>
+#include <cmath>
+#include <cstdio>
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -52,7 +54,10 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   path.header.frame_id = "camera_init";
 }
 
-LIVMapper::~LIVMapper() {}
+LIVMapper::~LIVMapper()
+{
+  flushOnlineMapHeader(true);
+}
 
 
 void LIVMapper::readParameters(ros::NodeHandle &nh)
@@ -229,10 +234,10 @@ bool LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
       }
     }
   sub_pcl = p_pre->lidar_type == AVIA ? 
-            nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this): 
-            nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
+            nh.subscribe(lid_topic, 100, &LIVMapper::livox_pcl_cbk, this): 
+            nh.subscribe(lid_topic, 100, &LIVMapper::standard_pcl_cbk, this);
   sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
-  sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+  sub_img = nh.subscribe(img_topic, 30, &LIVMapper::img_cbk, this);
   
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -258,7 +263,7 @@ bool LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
     sub_gps = nh.subscribe<gnss_comm::GnssPVTSolnMsg>(gps_topic, 2000, &LIVMapper::rtk_cbk, this);
   }
   pub_odom = nh.advertise<nav_msgs::Odometry>("/odometry/fast_livo2", 10000);
-  pub_lidarRGB = nh.advertise<sensor_msgs::PointCloud2>("/synced_cloud", 10000);
+  pub_lidarRGB = nh.advertise<sensor_msgs::PointCloud2>("/synced_cloud", 10);
   pub_rtk = nh.advertise<nav_msgs::Odometry>("/gps/odometry", 10000);
 
   return true;
@@ -551,6 +556,48 @@ void LIVMapper::handleLIO()
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
 }
 
+void LIVMapper::appendUniqueMapCloud(const PointCloudXYZRGB::Ptr &cloud)
+{
+  if (!cloud || cloud->empty()) return;
+  const double leaf = std::max(filter_size_pcd, 0.05);
+  const double inv_leaf = 1.0 / leaf;
+  auto &dst = pcl_wait_save->points;
+  dst.reserve(dst.size() + cloud->size());
+  for (const auto &pt : cloud->points)
+  {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+    const MapVoxelKey key{static_cast<int>(std::floor(pt.x * inv_leaf)),
+                          static_cast<int>(std::floor(pt.y * inv_leaf)),
+                          static_cast<int>(std::floor(pt.z * inv_leaf))};
+    if (!saved_rgb_voxels_.insert(key).second) continue;
+    dst.push_back(pt);
+  }
+  pcl_wait_save->width = static_cast<uint32_t>(dst.size());
+  pcl_wait_save->height = 1;
+  pcl_wait_save->is_dense = false;
+}
+
+void LIVMapper::appendUniqueMapCloud(const PointCloudXYZI::Ptr &cloud)
+{
+  if (!cloud || cloud->empty()) return;
+  const double leaf = std::max(filter_size_pcd, 0.05);
+  const double inv_leaf = 1.0 / leaf;
+  auto &dst = pcl_wait_save_intensity->points;
+  dst.reserve(dst.size() + cloud->size());
+  for (const auto &pt : cloud->points)
+  {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+    const MapVoxelKey key{static_cast<int>(std::floor(pt.x * inv_leaf)),
+                          static_cast<int>(std::floor(pt.y * inv_leaf)),
+                          static_cast<int>(std::floor(pt.z * inv_leaf))};
+    if (!saved_intensity_voxels_.insert(key).second) continue;
+    dst.push_back(pt);
+  }
+  pcl_wait_save_intensity->width = static_cast<uint32_t>(dst.size());
+  pcl_wait_save_intensity->height = 1;
+  pcl_wait_save_intensity->is_dense = false;
+}
+
 void LIVMapper::mergeCloudChunks()
 {
   if (!cloud_chunks_.empty())
@@ -590,6 +637,111 @@ void LIVMapper::mergeCloudChunks()
     pcl_wait_save_intensity->is_dense = false;
     cloud_chunks_intensity_.clear();
   }
+}
+
+bool LIVMapper::ensureOnlineMapStream(bool rgb)
+{
+  if (online_map_stream_.is_open()) return true;
+  online_map_pcd_path_ = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
+  online_map_stream_.open(online_map_pcd_path_.c_str(),
+                          std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+  if (!online_map_stream_.is_open())
+  {
+    ROS_WARN("[MapSave] failed to open %s", online_map_pcd_path_.c_str());
+    return false;
+  }
+
+  std::string header;
+  header += "# .PCD v0.7 - Point Cloud Data file format\n";
+  header += "VERSION 0.7\n";
+  header += rgb ? "FIELDS x y z rgb\n" : "FIELDS x y z intensity\n";
+  header += "SIZE 4 4 4 4\n";
+  header += "TYPE F F F F\n";
+  header += "COUNT 1 1 1 1\n";
+  header += "WIDTH ";
+  online_map_width_pos_ = static_cast<std::streamoff>(header.size());
+  header += "0000000000\n";
+  header += "HEIGHT 1\n";
+  header += "VIEWPOINT 0 0 0 1 0 0 0\n";
+  header += "POINTS ";
+  online_map_points_pos_ = static_cast<std::streamoff>(header.size());
+  header += "0000000000\n";
+  header += "DATA binary\n";
+  online_map_stream_.write(header.data(), static_cast<std::streamsize>(header.size()));
+  online_map_points_written_ = 0;
+  online_map_frames_since_flush_ = 0;
+  return online_map_stream_.good();
+}
+
+void LIVMapper::flushOnlineMapHeader(bool close_stream)
+{
+  if (!online_map_stream_.is_open()) return;
+  char digits[16];
+  std::snprintf(digits, sizeof(digits), "%010zu", online_map_points_written_);
+  const auto end_pos = online_map_stream_.tellp();
+  online_map_stream_.seekp(online_map_width_pos_);
+  online_map_stream_.write(digits, 10);
+  online_map_stream_.seekp(online_map_points_pos_);
+  online_map_stream_.write(digits, 10);
+  if (!close_stream) online_map_stream_.seekp(end_pos);
+  online_map_stream_.flush();
+  online_map_frames_since_flush_ = 0;
+  if (!close_stream) return;
+  online_map_stream_.close();
+  std::cout << GREEN << "Downsampled point cloud data saved to: " << online_map_pcd_path_
+            << " with point count: " << online_map_points_written_ << RESET << std::endl;
+}
+
+void LIVMapper::appendOnlineMapCloud(const PointCloudXYZRGB::Ptr &cloud)
+{
+  if (!pcd_save_en || localization_en || pcd_save_interval >= 0 || !cloud || cloud->empty()) return;
+  const float leaf = static_cast<float>(std::max(filter_size_pcd, 0.05));
+  PointCloudXYZRGB::Ptr filtered(new PointCloudXYZRGB());
+  pcl::ApproximateVoxelGrid<PointTypeRGB> voxel_filter;
+  voxel_filter.setInputCloud(cloud);
+  voxel_filter.setLeafSize(leaf, leaf, leaf);
+  voxel_filter.filter(*filtered);
+  if (filtered->empty() || !ensureOnlineMapStream(true)) return;
+
+  const double inv_leaf = 1.0 / static_cast<double>(leaf);
+  for (const auto &pt : filtered->points)
+  {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+    const MapVoxelKey key{static_cast<int>(std::floor(pt.x * inv_leaf)),
+                          static_cast<int>(std::floor(pt.y * inv_leaf)),
+                          static_cast<int>(std::floor(pt.z * inv_leaf))};
+    if (!saved_rgb_voxels_.insert(key).second) continue;
+    const float record[4] = {pt.x, pt.y, pt.z, pt.rgb};
+    online_map_stream_.write(reinterpret_cast<const char *>(record), sizeof(record));
+    ++online_map_points_written_;
+  }
+  if (++online_map_frames_since_flush_ >= 50) flushOnlineMapHeader(false);
+}
+
+void LIVMapper::appendOnlineMapCloud(const PointCloudXYZI::Ptr &cloud)
+{
+  if (!pcd_save_en || localization_en || pcd_save_interval >= 0 || !cloud || cloud->empty()) return;
+  const float leaf = static_cast<float>(std::max(filter_size_pcd, 0.05));
+  PointCloudXYZI::Ptr filtered(new PointCloudXYZI());
+  pcl::ApproximateVoxelGrid<PointType> voxel_filter;
+  voxel_filter.setInputCloud(cloud);
+  voxel_filter.setLeafSize(leaf, leaf, leaf);
+  voxel_filter.filter(*filtered);
+  if (filtered->empty() || !ensureOnlineMapStream(false)) return;
+
+  const double inv_leaf = 1.0 / static_cast<double>(leaf);
+  for (const auto &pt : filtered->points)
+  {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+    const MapVoxelKey key{static_cast<int>(std::floor(pt.x * inv_leaf)),
+                          static_cast<int>(std::floor(pt.y * inv_leaf)),
+                          static_cast<int>(std::floor(pt.z * inv_leaf))};
+    if (!saved_intensity_voxels_.insert(key).second) continue;
+    const float record[4] = {pt.x, pt.y, pt.z, pt.intensity};
+    online_map_stream_.write(reinterpret_cast<const char *>(record), sizeof(record));
+    ++online_map_points_written_;
+  }
+  if (++online_map_frames_since_flush_ >= 50) flushOnlineMapHeader(false);
 }
 
 void LIVMapper::savePCD() 
@@ -1096,8 +1248,7 @@ void LIVMapper::run()
 
     stateEstimationAndMapping();
   }
-  //savePCD();
-  //if (map_save_en) saveMap();
+  flushOnlineMapHeader(true);
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -1631,6 +1782,13 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   }
 
   cv::Mat img_cur = getImageFromMsg(msg);
+  // Bag images are full resolution. VIO uses the scaled camera size, so shrink
+  // before buffering. A 2448x2048 BGR frame is ~15 MB; the scaled frame is ~4 MB.
+  if (vio_manager && vio_manager->width > 0 && vio_manager->height > 0 &&
+      (img_cur.cols != vio_manager->width || img_cur.rows != vio_manager->height))
+  {
+    cv::resize(img_cur, img_cur, cv::Size(vio_manager->width, vio_manager->height), 0, 0, cv::INTER_LINEAR);
+  }
   img_buffer.push_back(img_cur);
   img_time_buffer.push_back(img_time_correct);
 
@@ -2124,16 +2282,13 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       case 0: /** world frame **/
         if (pcd_save_interval < 0)
         {
-          // Keep each frame separate. Concatenating here copies the whole map every scan.
           if (slam_mode_ == LIVO)
           {
-            if (!laserCloudWorldRGB->empty()) cloud_chunks_.push_back(laserCloudWorldRGB);
+            appendOnlineMapCloud(laserCloudWorldRGB);
           }
-          else if (!pcl_w_wait_pub->empty())
+          else if (LidarMeasures.lio_vio_flg == LIO || LidarMeasures.lio_vio_flg == LO)
           {
-            PointCloudXYZI::Ptr chunk(new PointCloudXYZI());
-            *chunk = *pcl_w_wait_pub;
-            cloud_chunks_intensity_.push_back(chunk);
+            appendOnlineMapCloud(pcl_w_wait_pub);
           }
         }
         else if (slam_mode_ == LIVO)
