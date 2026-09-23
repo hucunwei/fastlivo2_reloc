@@ -1,4 +1,4 @@
-# FAST-LIVO2（本仓库）
+# FAST-LIVO2-RTK-Reloc（本仓库）
 
 本仓库基于原版 [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2)（HKU MARS）修改。在线的激光–惯性–视觉里程计仍沿用原版流程。原版的论文、传感器示例和许可证见上游仓库；下面只写本仓库多出来的部分，以及 HH-LVGO 数据的运行步骤。
 
