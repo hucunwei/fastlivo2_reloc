@@ -11,6 +11,8 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include <gnss_comm/GnssPVTSolnMsg.h>
+#include <GeographicLib/LocalCartesian.hpp>
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -130,6 +132,18 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("publish/pub_effect_point_en", pub_effect_point_en, false);
   nh.param<bool>("publish/dense_map_en", dense_map_en, false);
 
+  // RTK-GNSS fusion parameters (auto-degrade to pure LIO/VIO when no RTK data)
+  nh.param<bool>("gps/gps_en", rtk_en, true);
+  nh.param<bool>("gps/debug_mode", debug_mode, false);
+  nh.param<std::string>("gps/gps_topic", gps_topic, "/ublox_driver/receiver_pvt");
+  nh.param<vector<double>>("gps/extrinsic_T", T_I_R, vector<double>());
+  nh.param<std::string>("laserMapping/outputfilepath", save_directory, "");
+  pcd_save_file = save_directory + "/debug/pcd/";
+  rtk_save_file = save_directory + "/debug/rtk.txt";
+  imu_save_file = save_directory + "/debug/imu.txt";
+  odom_save_file = save_directory + "/debug/odom.txt";
+  cov_save_file  = save_directory + "/debug/cov.txt";
+
   p_pre->blind_sqr = p_pre->blind * p_pre->blind;
 }
 
@@ -209,7 +223,7 @@ void LIVMapper::initializeFiles()
 bool LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
 {
     if (localization_en) { 
-
+      loadInitMapPose();
       if(!loadPriorMap()) {
        // return false;
       }
@@ -237,6 +251,15 @@ bool LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
+
+  // RTK-GNSS fusion: subscribe GPS topic and publish fused odometry (only when gps_en)
+  if (rtk_en)
+  {
+    sub_gps = nh.subscribe<gnss_comm::GnssPVTSolnMsg>(gps_topic, 2000, &LIVMapper::rtk_cbk, this);
+  }
+  pub_odom = nh.advertise<nav_msgs::Odometry>("/odometry/fast_livo2", 10000);
+  pub_lidarRGB = nh.advertise<sensor_msgs::PointCloud2>("/synced_cloud", 10000);
+  pub_rtk = nh.advertise<nav_msgs::Odometry>("/gps/odometry", 10000);
 
   return true;
 }
@@ -274,7 +297,7 @@ void LIVMapper::processImu()
 {
   // double t0 = omp_get_wtime();
 
-  p_imu->Process2(LidarMeasures, _state, feats_undistort);
+  p_imu->Process2(LidarMeasures, _state, feats_undistort, T_G_to_W);
 
   if (gravity_align_en) gravityAlignment();
 
@@ -392,7 +415,16 @@ void LIVMapper::handleLIO()
 
   double t1 = omp_get_wtime();
 
-  voxelmap_manager->StateEstimation(state_propagat);
+  V3D rtk_data = LidarMeasures.measures.back().rtk.p;
+  if(rtk_en && rtk_ini && LidarMeasures.measures.back().rtk.timestamp > 0.00001)
+  {
+    rtk_good = true;
+  }
+  else
+  {
+    rtk_good = false;
+  }
+  voxelmap_manager->StateEstimation(state_propagat, rtk_good, rtk_data);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
 
@@ -509,8 +541,50 @@ void LIVMapper::handleLIO()
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
 }
 
+void LIVMapper::mergeCloudChunks()
+{
+  if (!cloud_chunks_.empty())
+  {
+    size_t total = pcl_wait_save->size();
+    for (const auto &chunk : cloud_chunks_)
+    {
+      if (chunk) total += chunk->size();
+    }
+    pcl_wait_save->points.reserve(total);
+    for (const auto &chunk : cloud_chunks_)
+    {
+      if (chunk == nullptr || chunk->empty()) continue;
+      pcl_wait_save->points.insert(pcl_wait_save->points.end(), chunk->points.begin(), chunk->points.end());
+    }
+    pcl_wait_save->width = pcl_wait_save->points.size();
+    pcl_wait_save->height = 1;
+    pcl_wait_save->is_dense = false;
+    cloud_chunks_.clear();
+  }
+
+  if (!cloud_chunks_intensity_.empty())
+  {
+    size_t total = pcl_wait_save_intensity->size();
+    for (const auto &chunk : cloud_chunks_intensity_)
+    {
+      if (chunk) total += chunk->size();
+    }
+    pcl_wait_save_intensity->points.reserve(total);
+    for (const auto &chunk : cloud_chunks_intensity_)
+    {
+      if (chunk == nullptr || chunk->empty()) continue;
+      pcl_wait_save_intensity->points.insert(pcl_wait_save_intensity->points.end(), chunk->points.begin(), chunk->points.end());
+    }
+    pcl_wait_save_intensity->width = pcl_wait_save_intensity->points.size();
+    pcl_wait_save_intensity->height = 1;
+    pcl_wait_save_intensity->is_dense = false;
+    cloud_chunks_intensity_.clear();
+  }
+}
+
 void LIVMapper::savePCD() 
 {
+  mergeCloudChunks();
   if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
   {
     std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
@@ -520,7 +594,7 @@ void LIVMapper::savePCD()
     if (img_en)
     {
       pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-      pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
+      pcl::ApproximateVoxelGrid<pcl::PointXYZRGB> voxel_filter;
       voxel_filter.setInputCloud(pcl_wait_save);
       voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
       voxel_filter.filter(*downsampled_cloud);
@@ -671,6 +745,7 @@ void LIVMapper::saveMap()
   }
 
   /**************** Save colored dense map (VIO-colored scans, same as rviz display) ****************/
+  mergeCloudChunks();
   if (img_en && pcl_wait_save->size() > 0)
   {
     std::string colored_dir = save_dir + "colored_map.pcd";
@@ -693,6 +768,50 @@ bool LIVMapper::saveMapCallback(std_srvs::Trigger::Request &req, std_srvs::Trigg
   return true;
 }
 
+bool LIVMapper::loadInitMapPose()
+{
+  std::string init_map_pose_path = std::string(ROOT_DIR) + "Log/pcd/init_map_pose.txt";
+  std::ifstream f(init_map_pose_path.c_str());
+  if (!f.is_open())
+  {
+    ROS_WARN("[Localization] init_map_pose.txt not found (%s). Using localization/init_pos & init_yaw from yaml.",
+             init_map_pose_path.c_str());
+    return false;
+  }
+
+  std::string line;
+  double lat = 0.0, lon = 0.0, alt = 0.0, yaw = 0.0;
+  bool parsed = false;
+  while (std::getline(f, line))
+  {
+    if (line.empty() || line[0] == '#') continue;
+    std::stringstream ss(line);
+    if (ss >> lat >> lon >> alt >> yaw)
+    {
+      parsed = true;
+      break;
+    }
+  }
+  f.close();
+
+  if (!parsed)
+  {
+    ROS_WARN("[Localization] Failed to parse init_map_pose.txt (%s). Using localization/init_pos & init_yaw from yaml.",
+             init_map_pose_path.c_str());
+    return false;
+  }
+
+  map_origin_lat_ = lat;
+  map_origin_lon_ = lon;
+  map_origin_alt_ = alt;
+  map_origin_valid_ = true;
+  init_yaw = yaw;  // override the yaml init_yaw with the saved heading
+
+  ROS_INFO("[Localization] Loaded map origin (lat=%.9f lon=%.9f alt=%.3f) and init_yaw=%.6f rad from %s",
+           lat, lon, alt, yaw, init_map_pose_path.c_str());
+  return true;
+}
+
 bool LIVMapper::loadPriorMap()
 {
   if (prior_map_path.empty())
@@ -701,10 +820,49 @@ bool LIVMapper::loadPriorMap()
     // ros::shutdown();
     return false;
   }
-  pcl::PointCloud<pcl::PointXYZINormal>::Ptr prior_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
-  if (pcl::io::loadPCDFile(prior_map_path, *prior_cloud) < 0 || prior_cloud->empty())
+  // Read the raw PCD first. after_optimization_downsampled.pcd is PointXYZRGB
+  // (x,y,z,rgb); voxel_map.pcd is PointXYZINormal. Loading the RGB map directly
+  // as PointXYZINormal prints "Failed to find match for field" and zeros the
+  // missing intensity/normal/curvature fields.
+  pcl::PCLPointCloud2 blob;
+  if (pcl::io::loadPCDFile(prior_map_path, blob) < 0 || blob.width * blob.height == 0)
   {
     ROS_ERROR("[Localization] Failed to load prior map: %s", prior_map_path.c_str());
+    ros::shutdown();
+    return false;
+  }
+  bool has_normal = false;
+  for (const auto &field : blob.fields)
+  {
+    if (field.name == "normal_x") has_normal = true;
+  }
+
+  pcl::PointCloud<pcl::PointXYZINormal>::Ptr prior_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
+  if (has_normal)
+  {
+    pcl::fromPCLPointCloud2(blob, *prior_cloud);
+  }
+  else
+  {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr xyz(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::fromPCLPointCloud2(blob, *xyz);
+    prior_cloud->reserve(xyz->size());
+    for (const auto &src : xyz->points)
+    {
+      pcl::PointXYZINormal dst;
+      dst.x = src.x;
+      dst.y = src.y;
+      dst.z = src.z;
+      dst.intensity = 0.f;
+      dst.normal_x = dst.normal_y = dst.normal_z = 0.f;
+      dst.curvature = 0.f;
+      prior_cloud->push_back(dst);
+    }
+    ROS_INFO("[Localization] Prior map has xyz only; voxel planes will be fit by PCA.");
+  }
+  if (prior_cloud->empty())
+  {
+    ROS_ERROR("[Localization] Prior map is empty: %s", prior_map_path.c_str());
     ros::shutdown();
     return false;
   }
@@ -879,8 +1037,8 @@ void LIVMapper::run()
 
     stateEstimationAndMapping();
   }
-  savePCD();
-  if (map_save_en) saveMap();
+  //savePCD();
+  //if (map_save_en) saveMap();
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -1096,6 +1254,222 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   sig_buffer.notify_all();
 }
 
+void LIVMapper::rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
+{
+    Eigen::Vector3d trans_local_;
+    static bool first_gps = false;
+    if (!first_gps) {
+        first_gps = true;
+        if (localization_en && map_origin_valid_) {
+            // Use the map origin saved during mapping so the RTK->ENU conversion
+            // matches the prior map frame exactly.
+            gps_trans_.Reset(map_origin_lat_, map_origin_lon_, map_origin_alt_);
+        } else {
+            gps_trans_.Reset(gpsMsg->latitude, gpsMsg->longitude, gpsMsg->altitude);
+        }
+        if (debug_mode) {
+          std::ofstream gps_file_header(rtk_save_file, std::ios::out);
+          if (gps_file_header.is_open()) {
+              gps_file_header << "# timestamp x y z vx vy vz h_acc v_acc" << std::endl;
+              gps_file_header.close();
+          }
+        }
+    }
+
+    const double GPS_EPOCH_UNIX_TIME = 315964800.0;
+    const double SECONDS_PER_WEEK = 604800.0;
+    const double LEAP_SECONDS = 18.0;
+    int week = gpsMsg->time.week;
+    double tow = gpsMsg->time.tow;
+    double total_gps_seconds = (double)week * SECONDS_PER_WEEK + tow;
+    double timestamp_sec = total_gps_seconds + GPS_EPOCH_UNIX_TIME - LEAP_SECONDS;
+    ros::Time stamp;
+    stamp.fromSec(timestamp_sec);
+
+    gps_trans_.Forward(gpsMsg->latitude, gpsMsg->longitude, gpsMsg->altitude, trans_local_[0], trans_local_[1], trans_local_[2]);
+
+    RTK rtk_data;
+    rtk_data.timestamp = stamp.toSec() - 0.001;
+    rtk_data.p[0] = trans_local_[0];
+    rtk_data.p[1] = trans_local_[1];
+    rtk_data.p[2] = trans_local_[2];
+    rtk_data.v[0] = gpsMsg->vel_e;
+    rtk_data.v[1] = gpsMsg->vel_n;
+    rtk_data.v[2] = -gpsMsg->vel_d;
+
+    rtk_buffer.push_back(rtk_data);
+
+    if(trans_local_.norm() > 50.0 && rtk_ini == false && rtk_en == true)
+    {
+      ROS_INFO("Start INIT RTK to LIVO TRANSFORMATION");
+      InitializeRTK();
+      ROS_INFO("RTK to LIVO TRANSFORMATION INITIALIZED");
+      rtk_ini = true;
+    }
+
+    nav_msgs::Odometry gps_odom;
+    gps_odom.header.stamp = stamp;
+    gps_odom.header.frame_id = "camera_init";
+    gps_odom.pose.pose.position.x = trans_local_[0];
+    gps_odom.pose.pose.position.y = trans_local_[1];
+    gps_odom.pose.pose.position.z = trans_local_[2];
+    gps_odom.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, 0.0);
+    gps_odom.twist.twist.linear.x = gpsMsg->vel_e;
+    gps_odom.twist.twist.linear.y = gpsMsg->vel_n;
+    gps_odom.twist.twist.linear.z = -gpsMsg->vel_d;
+    gps_odom.pose.covariance[0] = gpsMsg->h_acc;
+    gps_odom.pose.covariance[7] = gpsMsg->h_acc;
+    gps_odom.pose.covariance[14] = gpsMsg->v_acc;
+
+    pub_rtk.publish(gps_odom);
+
+    if(debug_mode)
+    {
+      std::ofstream gps_file(rtk_save_file, std::ios::app);
+      if (gps_file.is_open()) {
+          gps_file << std::fixed << std::setprecision(6)
+                  << gps_odom.header.stamp.toSec() << " "
+                  << trans_local_[0] << " "
+                  << trans_local_[1] << " "
+                  << trans_local_[2] << " "
+                  << gpsMsg->vel_e << " "
+                  << gpsMsg->vel_n << " "
+                  << -gpsMsg->vel_d << " "
+                  << gpsMsg->h_acc << " "
+                  << gpsMsg->v_acc
+                  << std::endl;
+          gps_file.close();
+      }
+    }
+}
+
+Sophus::SE3 computeSVD(const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& target,
+    const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& source)
+{
+    if (target.empty() || target.size() != source.size()) {
+        return Sophus::SE3();
+    }
+
+    Eigen::Vector3d target_center = Eigen::Vector3d::Zero();
+    Eigen::Vector3d source_center = Eigen::Vector3d::Zero();
+    for (const auto& p : target) target_center += p;
+    for (const auto& p : source) source_center += p;
+    target_center /= target.size();
+    source_center /= source.size();
+
+    Eigen::Matrix3d W = Eigen::Matrix3d::Zero();
+    for (size_t i = 0; i < source.size(); ++i) {
+        W += (target[i] - target_center) * (source[i] - source_center).transpose();
+    }
+
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(W, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d R = svd.matrixU() * svd.matrixV().transpose();
+    if (R.determinant() < 0) {
+        R = svd.matrixU() * Eigen::DiagonalMatrix<double, 3>(1, 1, -1) * svd.matrixV().transpose();
+    }
+
+    Eigen::Vector3d t = target_center - R * source_center;
+
+    return Sophus::SE3(Sophus::SO3(R), t);
+}
+
+void LIVMapper::InitializeRTK()
+{
+    const double time_sync_threshold = 0.05;
+
+    std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> pts_source_livo; // Source
+    std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> pts_target_rtk;  // Target
+    auto livo_it = livo_state_buffer.begin();
+
+    for (const auto& rtk_data : rtk_buffer)
+    {
+        double t_rtk = rtk_data.timestamp;
+        while (livo_it != livo_state_buffer.end())
+        {
+            double t_livo = (*livo_it)[0];
+            if (t_livo < t_rtk - time_sync_threshold) {
+                livo_it++;
+            } else {
+                break;
+            }
+        }
+
+        if (livo_it == livo_state_buffer.end()) break;
+
+        auto best_it = livo_it;
+        double min_dt = std::abs((*best_it)[0] - t_rtk);
+
+        auto next_it = std::next(livo_it);
+        if (next_it != livo_state_buffer.end())
+        {
+            double dt_next = std::abs((*next_it)[0] - t_rtk);
+            if (dt_next < min_dt)
+            {
+                min_dt = dt_next;
+                best_it = next_it;
+            }
+        }
+
+        if (min_dt < time_sync_threshold)
+        {
+            if (best_it->size() < 4) {
+                ROS_ERROR("LIVO buffer data size is too small (%lu < 4)! Check data collection.", best_it->size());
+            }
+            pts_target_rtk.push_back(rtk_data.p);
+            Eigen::Vector3d p_livo((*best_it)[1], (*best_it)[2], (*best_it)[3]);
+            pts_source_livo.push_back(p_livo);
+        }
+    }
+
+    if (pts_target_rtk.size() < 3) {
+        ROS_WARN("Not enough matched points for RTK initialization (found %lu). Waiting for more data...", pts_target_rtk.size());
+    }
+    ROS_INFO("pts_target_rtk size: %lu, pts_source_livo size: %lu", pts_target_rtk.size(), pts_source_livo.size());
+    T_W_to_G = computeSVD(pts_target_rtk, pts_source_livo);
+    T_G_to_W = T_W_to_G.inverse();
+}
+
+void LIVMapper::handleRTK()
+{
+  if (LidarMeasures.measures.empty())
+  {
+      return;
+  }
+
+  auto rtk_data = LidarMeasures.measures.back().rtk;
+  if(rtk_data.timestamp < 0.00001)
+  {
+    return;
+  }
+
+  Eigen::Vector3d z_k = rtk_data.p;
+  z_k[2] = _state.pos_end(2);
+  Eigen::Vector3d T_I_to_R;
+  T_I_to_R[0] = T_I_R[0];
+  T_I_to_R[1] = T_I_R[1];
+  T_I_to_R[2] = T_I_R[2];
+
+  Eigen::Matrix3d R_cov = Eigen::Matrix3d::Identity() * 1e-4 * 5;
+
+  Eigen::Matrix<double, 3, DIM_STATE> H;
+  H.setZero();
+  H.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();
+
+  Eigen::Matrix<double, DIM_STATE, DIM_STATE> P = _state.cov;
+  Eigen::Matrix<double, 3, 3> S = H * P * H.transpose() + R_cov;
+  Eigen::Matrix<double, DIM_STATE, 3> K = P * H.transpose() * S.inverse();
+  Eigen::Vector3d y = z_k - (_state.pos_end + _state.rot_end * T_I_to_R);
+  Eigen::Matrix<double, DIM_STATE, 1> dx = K * y;
+  _state += dx;
+
+  if (_state.gravity.norm() > 0.1) {
+      _state.gravity += dx.segment<3>(16);
+  }
+
+  Eigen::Matrix<double, DIM_STATE, DIM_STATE> I = Eigen::Matrix<double, DIM_STATE, DIM_STATE>::Identity();
+  _state.cov = (I - K * H) * P;
+}
+
 void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
   if (!imu_en) return;
@@ -1262,6 +1636,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     meas.measures.push_back(m);
     // ROS_INFO("ONlY HAS LiDAR and IMU, NO IMAGE!");
     lidar_pushed = false; // sync one whole lidar scan.
+    if(!img_en) keyframe_time = meas.lidar_frame_end_time;
     return true;
 
     break;
@@ -1281,6 +1656,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     {
       // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
       double img_capture_time = img_time_buffer.front() + exposure_time_init;
+      if(img_en) keyframe_time = img_capture_time;
       /*** has img topic, but img topic timestamp larger than lidar end time,
        * process lidar topic. After LIO update, the meas.lidar_frame_end_time
        * will be refresh. ***/
@@ -1313,8 +1689,25 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // printf("[ Data Cut ] LIO \n");
       // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
       m.imu.clear();
+      m.rtk.timestamp = 0.0;
+      m.rtk.p = Eigen::Vector3d::Zero();
       m.lio_time = img_capture_time;
       mtx_buffer.lock();
+
+      if (rtk_en && rtk_ini)
+      {
+          while (!rtk_buffer.empty())
+          {
+            if (rtk_buffer.front().timestamp > m.lio_time) break;
+            if (rtk_buffer.front().timestamp > meas.last_lio_update_time)
+            {
+                m.rtk = rtk_buffer.front();
+                break;
+            }
+            rtk_buffer.pop_front();
+          }
+      }
+
       while (!imu_buffer.empty())
       {
         if (imu_buffer.front()->header.stamp.toSec() > m.lio_time) break;
@@ -1463,6 +1856,7 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
 void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager)
 {
   if (pcl_w_wait_pub->empty()) return;
+  const double t_pub_begin = omp_get_wtime();
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
   static int pub_num = 1;
   pub_num++;
@@ -1518,6 +1912,138 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   laserCloudmsg.header.frame_id = "camera_init";
   pubLaserCloudFullRes.publish(laserCloudmsg);
 
+  // RTK-GNSS fusion: publish body-frame cloud for backend optimization sync
+  if (img_en)
+  {
+    PointCloudXYZRGB::Ptr laserCloudBodyRGB(new PointCloudXYZRGB());
+    laserCloudBodyRGB->reserve(laserCloudWorldRGB->size());
+    for (const auto& pt_world_rgb : laserCloudWorldRGB->points)
+    {
+          V3D p_global(pt_world_rgb.x, pt_world_rgb.y, pt_world_rgb.z);
+          V3D p_body = _state.rot_end.transpose() * (p_global - _state.pos_end);
+          PointTypeRGB pointBodyRGB;
+          pointBodyRGB.x = p_body(0);
+          pointBodyRGB.y = p_body(1);
+          pointBodyRGB.z = p_body(2);
+          pointBodyRGB.r = pt_world_rgb.r;
+          pointBodyRGB.g = pt_world_rgb.g;
+          pointBodyRGB.b = pt_world_rgb.b;
+          laserCloudBodyRGB->push_back(pointBodyRGB);
+    }
+    sensor_msgs::PointCloud2 laserCloudbodymsg;
+    pcl::toROSMsg(*laserCloudBodyRGB, laserCloudbodymsg);
+    laserCloudbodymsg.header.stamp = ros::Time(keyframe_time);
+    laserCloudbodymsg.header.frame_id = "camera_init";
+    pub_lidarRGB.publish(laserCloudbodymsg);
+
+    if(debug_mode)
+    {
+      if (laserCloudBodyRGB->size() > 0)
+      {
+          std::stringstream ss;
+          ss << std::setfill('0') << std::setw(6) << pcd_file_index;
+          std::string pcd_filename = pcd_save_file + ss.str() + ".pcd";
+          pcl::io::savePCDFileBinary(pcd_filename, *laserCloudBodyRGB);
+          pcd_file_index++;
+      }
+    }
+  }
+
+  if(!img_en)
+  {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr laserCloudBody(new pcl::PointCloud<pcl::PointXYZI>());
+    laserCloudBody->reserve(pcl_w_wait_pub->size());
+    for (const auto& pt_world : pcl_w_wait_pub->points)
+    {
+          V3D p_global(pt_world.x, pt_world.y, pt_world.z);
+          V3D p_body = _state.rot_end.transpose() * (p_global - _state.pos_end);
+          pcl::PointXYZI pointBody;
+          pointBody.x = p_body(0);
+          pointBody.y = p_body(1);
+          pointBody.z = p_body(2);
+          laserCloudBody->push_back(pointBody);
+    }
+    sensor_msgs::PointCloud2 laserCloudbodymsg;
+    pcl::toROSMsg(*laserCloudBody, laserCloudbodymsg);
+    laserCloudbodymsg.header.stamp = ros::Time(keyframe_time);
+    laserCloudbodymsg.header.frame_id = "camera_init";
+    pub_lidarRGB.publish(laserCloudbodymsg);
+
+    if(debug_mode)
+    {
+      if (laserCloudBody->size() > 0)
+      {
+          std::stringstream ss;
+          ss << std::setfill('0') << std::setw(6) << pcd_file_index;
+          std::string pcd_filename = pcd_save_file + ss.str() + ".pcd";
+          pcl::io::savePCDFileBinary(pcd_filename, *laserCloudBody);
+          pcd_file_index++;
+      }
+    }
+  }
+
+  // RTK-GNSS fusion: cache LIVO state for RTK-LIVO transformation initialization
+  std::vector<double> livo_xyz(4);
+  livo_xyz[0] = keyframe_time;
+  livo_xyz[1] = _state.pos_end(0);
+  livo_xyz[2] = _state.pos_end(1);
+  livo_xyz[3] = _state.pos_end(2);
+  livo_state_buffer.push_back(livo_xyz);
+
+  // RTK-GNSS fusion: publish fused odometry with covariance for backend optimization
+  nav_msgs::Odometry odom_msg_ekf;
+  odom_msg_ekf.header.stamp = ros::Time(keyframe_time);
+  odom_msg_ekf.header.frame_id = "camera_init";
+  odom_msg_ekf.pose.pose.position.x = _state.pos_end(0);
+  odom_msg_ekf.pose.pose.position.y = _state.pos_end(1);
+  odom_msg_ekf.pose.pose.position.z = _state.pos_end(2);
+  Eigen::Quaterniond q(_state.rot_end);
+  odom_msg_ekf.pose.pose.orientation.w = q.w();
+  odom_msg_ekf.pose.pose.orientation.x = q.x();
+  odom_msg_ekf.pose.pose.orientation.y = q.y();
+  odom_msg_ekf.pose.pose.orientation.z = q.z();
+  odom_msg_ekf.twist.twist.linear.x = _state.vel_end(0);
+  odom_msg_ekf.twist.twist.linear.y = _state.vel_end(1);
+  odom_msg_ekf.twist.twist.linear.z = _state.vel_end(2);
+  Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> pose_cov_map(odom_msg_ekf.pose.covariance.data());
+
+  pose_cov_map.block<3, 3>(0, 0) = _state.cov.block<3, 3>(3, 3);
+  pose_cov_map.block<3, 3>(3, 3) = _state.cov.block<3, 3>(0, 0);
+  pose_cov_map.block<3, 3>(0, 3) = _state.cov.block<3, 3>(3, 0);
+  pose_cov_map.block<3, 3>(3, 0) = _state.cov.block<3, 3>(0, 3);
+  pub_odom.publish(odom_msg_ekf);
+
+  if(debug_mode)
+  {
+    std::ofstream odom_file(odom_save_file, std::ios::app);
+    if (odom_file.is_open()) {
+        odom_file << std::fixed << std::setprecision(6)
+                  << keyframe_time << " "
+                  << _state.pos_end(0) << " "
+                  << _state.pos_end(1) << " "
+                  << _state.pos_end(2) << " "
+                  << q.x() << " "
+                  << q.y() << " "
+                  << q.z() << " "
+                  << q.w() << " "
+                  << _state.vel_end(0) << " "
+                  << _state.vel_end(1) << " "
+                  << _state.vel_end(2) << std::endl;
+        odom_file.close();
+    }
+
+    std::ofstream cov_file(cov_save_file, std::ios::app);
+    if (cov_file.is_open()) {
+        cov_file << std::fixed << std::setprecision(6) << keyframe_time;
+
+        for (int i = 0; i < 36; ++i) {
+            cov_file << " " << odom_msg_ekf.pose.covariance[i];
+        }
+        cov_file << std::endl;
+        cov_file.close();
+    }
+  }
+
   /**************** save map ****************/
   /* 1. make sure you have enough memories
   /* 2. noted that pcd save will influence the real-time performences **/
@@ -1537,7 +2063,21 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
     switch (pcd_save_type)
     {
       case 0: /** world frame **/
-        if (slam_mode_ == LIVO)
+        if (pcd_save_interval < 0)
+        {
+          // Keep each frame separate. Concatenating here copies the whole map every scan.
+          if (slam_mode_ == LIVO)
+          {
+            if (!laserCloudWorldRGB->empty()) cloud_chunks_.push_back(laserCloudWorldRGB);
+          }
+          else if (!pcl_w_wait_pub->empty())
+          {
+            PointCloudXYZI::Ptr chunk(new PointCloudXYZI());
+            *chunk = *pcl_w_wait_pub;
+            cloud_chunks_intensity_.push_back(chunk);
+          }
+        }
+        else if (slam_mode_ == LIVO)
         {
           *pcl_wait_save += *laserCloudWorldRGB;
         }
@@ -1616,7 +2156,12 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   }
 
   if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
-  if(LidarMeasures.lio_vio_flg == VIO)  PointCloudXYZI().swap(*pcl_w_wait_pub);
+  if(LidarMeasures.lio_vio_flg == VIO)
+  {
+    PointCloudXYZI().swap(*pcl_w_wait_pub);
+    printf("[publish_frame_world] %.6f s chunks %zu frame_points %zu\n",
+           omp_get_wtime() - t_pub_begin, cloud_chunks_.size(), laserCloudWorldRGB->size());
+  }
 }
 
 void LIVMapper::publish_visual_sub_map(const ros::Publisher &pubSubVisualMap)

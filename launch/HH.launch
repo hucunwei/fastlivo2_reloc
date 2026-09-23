@@ -2,15 +2,18 @@
 <!-- Launch file for Livox AVIA LiDAR -->
 
 	<arg name="rviz" default="true" />
+	<arg name="outputfilepath" default="$(find fast_livo)/output" />
 
-	<rosparam command="load" file="$(find fast_livo)/config/MARS_LVIG.yaml" />
+	<rosparam command="load" file="$(find fast_livo)/config/HH-LVGO.yaml" />
 
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
-		<rosparam file="$(find fast_livo)/config/camera_MARS_LVIG.yaml" />
+		<rosparam file="$(find fast_livo)/config/camera_HH-LVGO-01.yaml" />
+		<param name="outputfilepath" value="$(arg outputfilepath)" />
+	
 	</node>
 	
 	<group if="$(arg rviz)">
-		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/M300.rviz" />
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
 	</group>
 	
 	<node pkg="image_transport" type="republish" name="republish" args="compressed in:=/left_camera/image raw out:=/left_camera/image" output="screen" respawn="false"/>

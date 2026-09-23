@@ -16,6 +16,7 @@ which is included as part of this source code package.
 #include <utils/so3_math.h>
 #include <utils/types.h>
 #include <utils/color.h>
+#include <utils/spline.h>
 #include <opencv2/opencv.hpp>
 #include <sensor_msgs/Imu.h>
 #include <sophus/se3.h>
@@ -59,16 +60,25 @@ enum EKF_STATE
   LO = 3
 };
 
+struct RTK
+{
+  double timestamp;
+  V3D p;
+  V3D v;
+};
+
 struct MeasureGroup
 {
   double vio_time;
   double lio_time;
   deque<sensor_msgs::Imu::ConstPtr> imu;
   cv::Mat img;
+  RTK rtk;
   MeasureGroup()
   {
     vio_time = 0.0;
     lio_time = 0.0;
+    rtk.timestamp = 0.0;
   };
 };
 

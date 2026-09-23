@@ -9,11 +9,13 @@ common:
 extrin_calib:
   extrinsic_T: [0.04165, 0.02326, -0.0284]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  Rcl: [0.00610193,-0.999863,-0.0154172,
-        -0.00615449,0.0153796,-0.999863,
-        0.999962,0.00619598,-0.0060598] 
-  Pcl: [0.0194384, 0.104689,-0.0251952]
-
+  # LidarToCamera 
+  # AGV-LVGO-02
+  Rcl: [ -0.002328, -0.999997,  0.000477,
+        -0.015224, -0.000441, -0.999884,
+        0.999881, -0.002335, -0.015223]
+  Pcl: [ -0.089164,  0.069986, -0.016360]
+  
 time_offset: 
   imu_time_offset: 0.0
   img_time_offset: 0.1
@@ -41,17 +43,18 @@ vio:
 imu:
   imu_en: true
   imu_int_frame: 30
-  acc_cov: 0.5 # 0.2
-  gyr_cov: 0.3 # 0.5
+  acc_cov: 2 # 0.2
+  gyr_cov: 0.1 #0.5
   b_acc_cov: 0.0001 # 0.1
   b_gyr_cov: 0.0001 # 0.1
+  ba_bg_est_en: true
 
 lio:
   max_iterations: 5
   dept_err: 0.02
   beam_err: 0.05
   min_eigen_value: 0.0025 # 0.005
-  voxel_size: 0.5
+  voxel_size: 2
   max_layer: 2
   max_points_num: 50
   layer_init_num: [5, 5, 5, 5, 5]
@@ -73,46 +76,26 @@ publish:
   blind_rgb_points: 0.0
 
 evo:
-  seq_name: "CBD_Building_01"
-  pose_output_en: false
-
-# # Prior-map localization (no mapping) mode.
-# # Workflow: 1) run mapping (localization_en: false) and save the map;
-# 2) copy the saved map to a SEPARATE file as the prior map;
-# 3) set localization_en: true and prior_map_path to that file to localize.
-localization:
-  localization_en: true
-  prior_map_path: "/home/hucunwei/study/fastlivo2/src/FAST-LIVO2/Log/pcd/retail_street/all_downsampled_points.pcd"   # use a SEPARATE prior map file, NOT Log/pcd/voxel_map.pcd (it gets overwritten by every save!)   
-  init_pos: [0.0, 0.0, 0.0]
-  init_yaw: 0.0        # radians
-  sigma_num: 10.0      # matching gate multiplier (wider than mapping's 3 to tolerate initial pose error)
+  seq_name: "Grass01"
+  pose_output_en: true
 
 pcd_save:
-  pcd_save_en: true
-  map_save_en: true # Save voxel map & visual sparse map on exit (or via /laserMapping/save_map service)
-  type: 0 # 0: World Frame, 1: Body Frame;
+  pcd_save_en: false
   colmap_output_en: false # need to set interval = -1
   filter_size_pcd: 0.15
   interval: -1
   # how many LiDAR frames saved in each pcd file;
   # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
 
-image_save:
-  img_save_en: false
-  interval: 1
-
-# RTK-GNSS fusion (auto-degrades to pure LIO/VIO when no RTK data available)
 gps:
-  gps_en: false              # enable RTK fusion; without RTK sensor, system runs pure LIO/VIO
-  debug_mode: false         # save debug data (rtk/imu/odom/cov) to outputfilepath
+  gps_en: true
+  debug_mode: false
   gps_time_offset: 0.0
-  extrinsic_T: [0, 0, 0]    # IMU to RTK antenna translation
+  extrinsic_T: [0, 0, 0]
   gps_topic: "/ublox_driver/receiver_pvt"
 
-# Backend optimization (GTSAM factor graph)
 opt:
-  opt_enable: false
   load_data: false
-  rtk_cov: 0.01
+  rtk_cov: 0.05
   livo2_RPY_cov: 0.00000001
-  livo2_XYZ_cov: 0.001
+  livo2_XYZ_cov: 0.0001

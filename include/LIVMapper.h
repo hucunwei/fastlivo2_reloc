@@ -16,11 +16,15 @@ which is included as part of this source code package.
 #include "IMU_Processing.h"
 #include "vio.h"
 #include "preprocess.h"
+#include <pcl/filters/approximate_voxel_grid.h>
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
 #include <std_srvs/Trigger.h>
+#include <gnss_comm/GnssPVTSolnMsg.h>
+#include <GeographicLib/LocalCartesian.hpp>
 #include <vikit/camera_loader.h>
+#include <vector>
 
 class LIVMapper
 {
@@ -36,11 +40,14 @@ public:
   void stateEstimationAndMapping();
   void handleVIO();
   void handleLIO();
+  void handleRTK();
   void savePCD();
+  void mergeCloudChunks();
   void saveMap();
   void collectVoxelPoints(const VoxelOctoTree *octo, pcl::PointCloud<pcl::PointXYZINormal> &cloud);
   bool saveMapCallback(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res);
   bool loadPriorMap();
+  bool loadInitMapPose();
   void processImu();
   
   bool sync_packages(LidarMeasureGroup &meas);
@@ -54,6 +61,8 @@ public:
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+  void rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg);
+  void InitializeRTK();
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -143,10 +152,13 @@ public:
   PointCloudXYZI::Ptr pcl_wait_pub;
   PointCloudXYZRGB::Ptr pcl_wait_save;
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
+  // Per-frame clouds kept until exit. Avoids copying the whole map on every scan.
+  std::vector<PointCloudXYZRGB::Ptr> cloud_chunks_;
+  std::vector<PointCloudXYZI::Ptr> cloud_chunks_intensity_;
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 
-  pcl::VoxelGrid<PointType> downSizeFilterSurf;
+  pcl::ApproximateVoxelGrid<PointType> downSizeFilterSurf;
 
   V3D euler_cur;
 
@@ -198,5 +210,36 @@ public:
   V3D init_pos{0, 0, 0};
   double init_yaw = 0.0;
   double localization_sigma_num = 10.0;
+  double map_origin_lat_ = 0.0, map_origin_lon_ = 0.0, map_origin_alt_ = 0.0;
+  bool map_origin_valid_ = false;
+
+  // RTK-GNSS fusion (auto-degrades to pure LIO/VIO when no RTK data)
+  bool rtk_en = true;
+  bool rtk_ini = false;
+  bool rtk_good = false;
+  std::deque<RTK> rtk_buffer;
+  std::deque<RTK> rtk_proc_buffer;
+  std::deque<std::vector<double>> livo_state_buffer;
+  Sophus::SE3 T_W_to_G;
+  Sophus::SE3 T_G_to_W;
+  vector<double> T_I_R;
+  GeographicLib::LocalCartesian gps_trans_;
+  std::string gps_topic;
+
+  int pcd_file_index = 0;
+  bool debug_mode = false;
+  std::string save_directory;
+  std::string pcd_save_file;
+  std::string rtk_save_file;
+  std::string imu_save_file;
+  std::string odom_save_file;
+  std::string cov_save_file;
+
+  double keyframe_time = 0.0;
+
+  ros::Subscriber sub_gps;
+  ros::Publisher pub_odom;
+  ros::Publisher pub_lidarRGB;
+  ros::Publisher pub_rtk;
 };
 #endif

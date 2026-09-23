@@ -1,0 +1,16 @@
+<launch>
+<!-- Launch file for Livox AVIA LiDAR (gdb debug) -->
+
+	<arg name="outputfilepath" default="$(find fast_livo)/output" />
+
+	<rosparam command="load" file="$(find fast_livo)/config/HH-LVGO.yaml" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen"
+	      launch-prefix="gdb -batch -ex run -ex bt -ex quit --args">
+		<rosparam file="$(find fast_livo)/config/camera_HH-LVGO-01.yaml" />
+		<param name="outputfilepath" value="$(arg outputfilepath)" />
+	</node>
+
+	<node pkg="image_transport" type="republish" name="republish" args="compressed in:=/left_camera/image raw out:=/left_camera/image" output="screen" respawn="false"/>
+
+</launch>
