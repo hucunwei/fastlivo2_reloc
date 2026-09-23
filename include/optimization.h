@@ -170,6 +170,7 @@ public:
     double map_origin_lat_ = 0.0;
     double map_origin_lon_ = 0.0;
     double map_origin_alt_ = 0.0;
+    bool map_frame_aligned_ = false;
 
     // Voxel-grid leaf size [m] for the downsampled map saved by saveOptimizedGlobalMap().
     double map_voxel_size_ = 0.15;

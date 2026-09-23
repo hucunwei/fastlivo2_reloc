@@ -463,6 +463,36 @@ void optimization::offlineOptimizationTask() {
         keyFrames[i].pose = imu_optimizedPose;
     }
 
+    // The map is built from these IMU poses. Persist the first one so localization
+    // starts in the same ENU frame. eulerAngles yaw from the alignment rotation is
+    // not the vehicle heading.
+    if (map_frame_aligned_ && !keyFrames.empty()) {
+        const gtsam::Pose3 &pose0 = keyFrames.front().pose;
+        const gtsam::Point3 t = pose0.translation();
+        const gtsam::Quaternion q = pose0.rotation().toQuaternion();
+        const double yaw = std::atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
+                                       1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+        const std::string init_map_pose_path = std::string(ROOT_DIR) + "Log/pcd/init_map_pose.txt";
+        std::ofstream f(init_map_pose_path.c_str());
+        if (f.is_open()) {
+            f << "# map_origin_lat map_origin_lon map_origin_alt yaw_rad\n";
+            f << std::fixed << std::setprecision(12)
+              << map_origin_lat_ << " " << map_origin_lon_ << " "
+              << map_origin_alt_ << " " << yaw << "\n";
+            f << "# init_pose time tx ty tz qx qy qz qw\n";
+            f << std::setprecision(9)
+              << keyFrames.front().time << " "
+              << t.x() << " " << t.y() << " " << t.z() << " "
+              << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+            f.close();
+            ROS_INFO("[Offline Optimization] Saved init pose to %s (pos=%.3f %.3f %.3f yaw=%.6f rad)",
+                     init_map_pose_path.c_str(), t.x(), t.y(), t.z(), yaw);
+        } else {
+            ROS_WARN("[Offline Optimization] Failed to write init_map_pose.txt: %s",
+                     init_map_pose_path.c_str());
+        }
+    }
+
     std::cout << "[Offline Optimization] Saving maps and trajectories..." << std::endl;
     //savekeyframescan();
     saveOptimizedGlobalMap();
@@ -1091,7 +1121,8 @@ void optimization::initialAlign()
         initialEstimate.update(i, T_enu_gps);
         keyFrames[i].pose = T_enu_gps;
     }
-    
+
+    map_frame_aligned_ = true;
     ROS_INFO("[initialAlign] Spline-based alignment complete.");
 }
 

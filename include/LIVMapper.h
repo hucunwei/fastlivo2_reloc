@@ -48,6 +48,7 @@ public:
   bool saveMapCallback(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res);
   bool loadPriorMap();
   bool loadInitMapPose();
+  void applyLocalizationInitPose();
   void processImu();
   
   bool sync_packages(LidarMeasureGroup &meas);
@@ -209,6 +210,9 @@ public:
   ros::Publisher prior_map_pub_;
   V3D init_pos{0, 0, 0};
   double init_yaw = 0.0;
+  Eigen::Quaterniond loc_init_quat_{1.0, 0.0, 0.0, 0.0};
+  bool loc_init_pose_valid_ = false;
+  bool loc_init_pose_applied_ = false;
   double localization_sigma_num = 10.0;
   double map_origin_lat_ = 0.0, map_origin_lon_ = 0.0, map_origin_alt_ = 0.0;
   bool map_origin_valid_ = false;

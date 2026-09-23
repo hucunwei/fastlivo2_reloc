@@ -297,7 +297,17 @@ void LIVMapper::processImu()
 {
   // double t0 = omp_get_wtime();
 
+  const bool imu_was_initializing = p_imu->imu_need_init;
   p_imu->Process2(LidarMeasures, _state, feats_undistort, T_G_to_W);
+
+  // IMU_init forces rot_end to identity. Re-apply the ENU pose from the prior
+  // map once, after that reset and before the first undistortion uses the state.
+  if (localization_en && loc_init_pose_valid_ && !loc_init_pose_applied_ &&
+      imu_was_initializing && !p_imu->imu_need_init)
+  {
+    applyLocalizationInitPose();
+    loc_init_pose_applied_ = true;
+  }
 
   if (gravity_align_en) gravityAlignment();
 
@@ -781,20 +791,33 @@ bool LIVMapper::loadInitMapPose()
 
   std::string line;
   double lat = 0.0, lon = 0.0, alt = 0.0, yaw = 0.0;
-  bool parsed = false;
+  double pose_time = 0.0, tx = 0.0, ty = 0.0, tz = 0.0;
+  double qx = 0.0, qy = 0.0, qz = 0.0, qw = 1.0;
+  bool parsed_origin = false;
+  bool parsed_pose = false;
   while (std::getline(f, line))
   {
     if (line.empty() || line[0] == '#') continue;
     std::stringstream ss(line);
-    if (ss >> lat >> lon >> alt >> yaw)
+    double v[8];
+    int n = 0;
+    while (n < 8 && (ss >> v[n])) n++;
+    if (n == 8)
     {
-      parsed = true;
-      break;
+      pose_time = v[0];
+      tx = v[1]; ty = v[2]; tz = v[3];
+      qx = v[4]; qy = v[5]; qz = v[6]; qw = v[7];
+      parsed_pose = true;
+    }
+    else if (n == 4)
+    {
+      lat = v[0]; lon = v[1]; alt = v[2]; yaw = v[3];
+      parsed_origin = true;
     }
   }
   f.close();
 
-  if (!parsed)
+  if (!parsed_origin)
   {
     ROS_WARN("[Localization] Failed to parse init_map_pose.txt (%s). Using localization/init_pos & init_yaw from yaml.",
              init_map_pose_path.c_str());
@@ -805,11 +828,39 @@ bool LIVMapper::loadInitMapPose()
   map_origin_lon_ = lon;
   map_origin_alt_ = alt;
   map_origin_valid_ = true;
-  init_yaw = yaw;  // override the yaml init_yaw with the saved heading
 
-  ROS_INFO("[Localization] Loaded map origin (lat=%.9f lon=%.9f alt=%.3f) and init_yaw=%.6f rad from %s",
-           lat, lon, alt, yaw, init_map_pose_path.c_str());
+  if (parsed_pose)
+  {
+    init_pos = V3D(tx, ty, tz);
+    loc_init_quat_ = Eigen::Quaterniond(qw, qx, qy, qz).normalized();
+    init_yaw = std::atan2(2.0 * (loc_init_quat_.w() * loc_init_quat_.z() +
+                                  loc_init_quat_.x() * loc_init_quat_.y()),
+                           1.0 - 2.0 * (loc_init_quat_.y() * loc_init_quat_.y() +
+                                        loc_init_quat_.z() * loc_init_quat_.z()));
+    loc_init_pose_valid_ = true;
+    ROS_INFO("[Localization] Loaded map origin (lat=%.9f lon=%.9f alt=%.3f) and init pose t=%.3f pos=(%.3f %.3f %.3f) yaw=%.6f rad from %s",
+             lat, lon, alt, pose_time, tx, ty, tz, init_yaw, init_map_pose_path.c_str());
+  }
+  else
+  {
+    init_yaw = yaw;
+    ROS_WARN("[Localization] init_map_pose.txt has no init_pose line. Using yaw=%.6f rad and yaml init_pos.",
+             yaw);
+    ROS_INFO("[Localization] Loaded map origin (lat=%.9f lon=%.9f alt=%.3f) and init_yaw=%.6f rad from %s",
+             lat, lon, alt, yaw, init_map_pose_path.c_str());
+  }
   return true;
+}
+
+void LIVMapper::applyLocalizationInitPose()
+{
+  _state.pos_end = init_pos;
+  _state.vel_end.setZero();
+  _state.rot_end = loc_init_quat_.toRotationMatrix();
+  _state.gravity = V3D(0.0, 0.0, -G_m_s2);
+  state_propagat = _state;
+  ROS_INFO("[Localization] Applied init pose after IMU init: pos=(%.3f %.3f %.3f) yaw=%.6f rad, gravity=(0, 0, -g)",
+           init_pos[0], init_pos[1], init_pos[2], init_yaw);
 }
 
 bool LIVMapper::loadPriorMap()
@@ -1001,9 +1052,17 @@ bool LIVMapper::loadPriorMap()
               << RESET << std::endl;
   }
 
-  // Initial pose: map origin by default (configurable via localization/init_pos & init_yaw)
+  // Initial pose in the prior-map ENU frame. IMU_init later resets rot_end to
+  // identity; applyLocalizationInitPose() writes this pose back once init ends.
   _state.pos_end = init_pos;
-  _state.rot_end = Eigen::AngleAxisd(init_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  if (loc_init_pose_valid_)
+  {
+    _state.rot_end = loc_init_quat_.toRotationMatrix();
+  }
+  else
+  {
+    _state.rot_end = Eigen::AngleAxisd(init_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  }
   state_propagat = _state;
   // Inflate the initial covariance so the EKF can make large corrections while
   // converging onto the prior map (the initial pose is only a rough guess).

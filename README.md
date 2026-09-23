@@ -1,154 +1,94 @@
-# FAST-LIVO2
+# FAST-LIVO2（本仓库）
 
-## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
+本仓库基于原版 [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2)（HKU MARS）修改。在线的激光–惯性–视觉里程计仍沿用原版流程。原版的论文、传感器示例和许可证见上游仓库；下面只写本仓库多出来的部分，以及 HH-LVGO 数据的运行步骤。
 
-### 📢 News
+## 与原版的差别
 
-- 🔓 **2025-01-23**: Code released!  
-- 🎉 **2024-10-01**: Accepted by **T-RO '24**!  
-- 🚀 **2024-07-02**: Conditionally accepted.
+### RTK
 
-### 📬 Contact
+订阅 `gnss_comm/GnssPVTSolnMsg`（默认话题 `/ublox_driver/receiver_pvt`），用 GeographicLib 转到局部 ENU，并作为位置观测融进在线 LIO。相关配置在 yaml 的 `gps` 段。
 
-For further inquiries or assistance, please contact [zhengcr@connect.hku.hk](mailto:zhengcr@connect.hku.hk).
+### 离线优化
 
-## 1. Introduction
+建图跑完后，在 `laserMapping` 所在终端按 Enter，做一次离线优化（`opt/opt_enable: true`，且不能处于定位模式）：
 
-FAST-LIVO2 is an efficient and accurate LiDAR-inertial-visual fusion localization and mapping system, demonstrating significant potential for real-time 3D reconstruction and onboard robotic localization in severely degraded environments.
+- 用速度序列估计激光里程计和 RTK 的时间偏移，再用样条把轨迹对齐到 RTK 的 ENU。
+- 用 GTSAM 做批量位姿优化。
+- 用优化后的 IMU 位姿把关键帧拼成下采样全局地图。
 
-**Developer**: [Chunran Zheng 郑纯然](https://github.com/xuankuzcr)
+产物：
 
-<div align="center">
-    <img src="pics/Framework.png" width = 100% >
-</div>
+- `Log/pcd/after_optimization_downsampled.pcd`：下采样后的先验地图。
+- `Log/pcd/init_map_pose.txt`：地图原点（纬度、经度、高程）和第一帧在该 ENU 下的位姿（位置 + 四元数）。
+- `output/TUM/opt_trajectory_after.txt`：优化后的 TUM 轨迹。
 
-### 1.1 Related video
+`roslaunch` 若拿不到标准输入，关键帧缓冲空闲后会自动开始这次优化。
 
-Our accompanying video is now available on [**Bilibili**](https://www.bilibili.com/video/BV1Ezxge7EEi) and [**YouTube**](https://youtu.be/6dF2DzgbtlY).
+### 先验地图定位
 
-### 1.2 Related paper
+`localization/localization_en: true` 时不再更新体素地图，而是加载 `prior_map_path` 里的先验点云做点面匹配。
 
-[FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry](https://arxiv.org/pdf/2408.14035)  
+- 先验图应使用上面优化得到的下采样地图的一份拷贝。不要直接把 `Log/pcd/voxel_map.pcd` 当先验图，每次保存都会覆盖它。
+- 启动时读取 `Log/pcd/init_map_pose.txt`。IMU 初始化会把姿态重置成单位阵；初始化结束后，再用文件里的第一帧位姿写回状态，并把重力设成 ENU 的 `(0, 0, -g)`，使定位坐标系和优化后的地图一致。
+- 需要从同一段数据的开头播放。文件里的位姿对应建图第一帧。
 
-[FAST-LIVO2 on Resource-Constrained Platforms](https://arxiv.org/pdf/2501.13876)  
+### 建图时的点云保存
 
-[FAST-LIVO: Fast and Tightly-coupled Sparse-Direct LiDAR-Inertial-Visual Odometry](https://arxiv.org/pdf/2203.00893)
+彩色点云按帧分块缓存，保存时再合并，避免每帧拷贝整张地图。关键帧下采样使用 `pcl::ApproximateVoxelGrid`，避免大范围点云上 `VoxelGrid` 的整数索引溢出。退出或调用 `/laserMapping/save_map` 时，还可另存体素地图和视觉稀疏地图。
 
-[FAST-Calib: LiDAR-Camera Extrinsic Calibration in One Second](https://www.arxiv.org/pdf/2507.17210)
+### 额外依赖
 
-### 1.3 Our hard-synchronized equipment
+在原版依赖之外还需要 GTSAM、GeographicLib，以及本工作空间里的 `gnss_comm`。x86 上编译选项与 GTSAM 对齐（`-march=x86-64`），避免 Eigen 跨库 ABI 不一致。
 
-We open-source our handheld device, including CAD files, synchronization scheme, STM32 source code, wiring instructions, and sensor ROS driver. Access these resources at this repository: [**LIV_handhold**](https://github.com/xuankuzcr/LIV_handhold).
+## 运行
 
-### 1.4 Our associate dataset: FAST-LIVO2-Dataset
-Our associate dataset [**FAST-LIVO2-Dataset**](https://connecthkuhk-my.sharepoint.com/:f:/g/personal/zhengcr_connect_hku_hk/ErdFNQtjMxZOorYKDTtK4ugBkogXfq1OfDm90GECouuIQA?e=KngY9Z) used for evaluation is also available online.
-
-### 1.5 Our LiDAR-camera calibration method
-The [**FAST-Calib**](https://github.com/hku-mars/FAST-Calib) toolkit is recommended. Its output extrinsic parameters can be directly filled into the YAML file. 
-
-## 2. Prerequisited
-
-### 2.1 Ubuntu and ROS
-
-Ubuntu 18.04~20.04.  [ROS Installation](http://wiki.ros.org/ROS/Installation).
-
-### 2.2 PCL && Eigen && OpenCV
-
-PCL>=1.8, Follow [PCL Installation](https://pointclouds.org/). 
-
-Eigen>=3.3.4, Follow [Eigen Installation](https://eigen.tuxfamily.org/index.php?title=Main_Page).
-
-OpenCV>=4.2, Follow [Opencv Installation](http://opencv.org/).
-
-### 2.3 Sophus
-
-Sophus Installation for the non-templated/double-only version.
+在本工作空间编译并 source：
 
 ```bash
-git clone https://github.com/strasdat/Sophus.git
-cd Sophus
-git checkout a621ff
-mkdir build && cd build && cmake ..
-make
-sudo make install
-```
-
-### 2.4 Vikit
-
-Vikit contains camera models, some math and interpolation functions that we need. Vikit is a catkin project, therefore, download it into your catkin workspace source folder.
-
-```bash
-# Different from the one used in fast-livo1
-cd catkin_ws/src
-git clone https://github.com/xuankuzcr/rpg_vikit.git 
-```
-
-## 3. Build
-
-Clone the repository and catkin_make:
-
-```
-cd ~/catkin_ws/src
-git clone https://github.com/hku-mars/FAST-LIVO2
-cd ../
+cd fastlivo2
 catkin_make
-source ~/catkin_ws/devel/setup.bash
+source devel/setup.bash
 ```
 
-## 4. Run our examples
+配置在 `config/HH-LVGO.yaml`，相机内参在 `config/camera_HH-LVGO-01.yaml`。数据包是压缩图像，`launch/HH.launch` 会把 `/left_camera/image/compressed` 转成原始图像。
 
-Download FAST-LIVO2-Dataset from [Global-LVBA](https://github.com/xuankuzcr/Global-LVBA) Section IV.
+### 建图
 
-```
-roslaunch fast_livo mapping_avia.launch
-rosbag play YOUR_DOWNLOADED.bag
-```
-
-
-## 5. Map Saving and Prior-Map Relocalization
-
-This fork extends FAST-LIVO2 with **map saving** and **prior-map based relocalization**, enabling the system to localize against a previously built map without mapping.
-
-### 5.1 Map Saving
-
-While running in mapping mode (`localization_en: false`), the voxel map and visual sparse map can be saved on exit or on demand via the `laserMapping/save_map` ROS service:
+在 `config/HH-LVGO.yaml` 里设：
 
 ```yaml
-pcd_save:
-  pcd_save_en: true      # save registered LiDAR point clouds
-  map_save_en: true      # save voxel map & visual sparse map (Log/pcd/)
-  type: 0                # 0: World Frame, 1: Body Frame
-  filter_size_pcd: 0.15  # downsample filter size [m]
-  interval: -1           # -1: all frames saved into ONE pcd file
+localization:
+  localization_en: false
+opt:
+  opt_enable: true
 ```
+
+然后：
 
 ```bash
-# Trigger map saving at any time (also saved automatically on exit):
-rosservice call /laserMapping/save_map
-# Map saved to Log/pcd/ (voxel_map.pcd, visual_map.pcd, etc.)
+roslaunch fast_livo HH.launch
+rosbag play xxx.bag
 ```
 
-> **Note**: `Log/pcd/voxel_map.pcd` is **overwritten** by every save. Always copy the saved map to a separate file before using it as a prior map.
+包播完后，在 `laserMapping` 终端按 Enter。确认生成 `Log/pcd/after_optimization_downsampled.pcd` 和 `Log/pcd/init_map_pose.txt`。把 pcd 拷到单独路径再给定位用，例如 `Log/pcd/hh-lvgo-01/after_optimization_downsampled_01.pcd`。
 
-### 5.2 Prior-Map Relocalization
+### 定位
 
-FAST-LIVO2 can localize against a previously saved map (no mapping update is performed, i.e. `Update Voxel Map` is disabled), using a prior-map guided initialization plus LIO tracking:
-
-1. Run a **mapping** session (`localization_en: false`) and save the map;
-2. Copy the saved map to a **separate** prior map file (e.g. `prior_map.pcd`);
-3. Enable localization mode and set `prior_map_path` to that file, then replay data from (approximately) the same start pose:
+把 yaml 改回定位，`prior_map_path` 指向刚才的拷贝：
 
 ```yaml
 localization:
   localization_en: true
-  prior_map_path: "/path/to/prior_map.pcd"  # use a SEPARATE prior map file!
-  init_pos: [0.0, 0.0, 0.0]                 # initial position [m] in the prior-map frame
-  init_yaw: 0.0                             # initial yaw [rad]
-  sigma_num: 10.0                           # matching gate multiplier (wider than mapping's 3)
+  prior_map_path: "/your/map/path/xxx.pcd"
 ```
 
-On startup, the prior map is loaded and voxelized (PCA plane fitting), and the initial pose is taken from `init_pos`/`init_yaw`. The system then performs direct LIO against the prior map with a widened matching gate (`sigma_num`) to tolerate initial pose error, without updating the voxel map.
+`init_pos` / `init_yaw` 会被 `Log/pcd/init_map_pose.txt` 覆盖。重新编译后从头播放同一段 bag：
 
-## 6. License
+```bash
+roslaunch fast_livo HH.launch
+rosbag play xxx.bag
+```
 
-The source code of this package is released under the [**GPLv2**](http://www.gnu.org/licenses/) license. For commercial use, please contact me at <zhengcr@connect.hku.hk> and Prof. Fu Zhang at <fuzhang@hku.hk> to discuss an alternative license.
+日志中应出现 `Applied init pose after IMU init`，位置和航向与 `init_map_pose.txt` 里的第一帧一致。
+
+AGV 数据把上面的 launch 和 yaml 换成 `launch/AGV.launch`、`config/AGV-LVGO.yaml`，步骤相同。
