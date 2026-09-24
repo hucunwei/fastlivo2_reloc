@@ -3,11 +3,16 @@
 #include <pcl/filters/approximate_voxel_grid.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <numeric>
+
+#include <sys/select.h>
+#include <unistd.h>
 
 namespace {
 struct VelocitySeries
@@ -295,15 +300,11 @@ optimization::optimization(ros::NodeHandle &nh)
     bool localization_en, opt_en;
     nh.param("localization/localization_en", localization_en, false);
     nh.param("opt/opt_enable", opt_en, false);
-    if (!opt_en || localization_en) {
-        ROS_INFO("Optimization mode: [OFFLINE] disabled due to localization mode or opt_enable=false.");
-        return;
-    }
     nh.param<std::string>("laserMapping/outputfilepath", outputfilepath, "");
     debug_optdata_path_ = outputfilepath + "/debug/";
-    opt_tum_output_path_ = outputfilepath + "/TUM/opt_trajectory_after.txt";
-    livo_tum_before_output_path_ = outputfilepath + "/TUM/livo_trajectory_before.txt";
-    rtk_tum_output_path_ = outputfilepath + "/TUM/rtk_trajectory_time_aligned.txt";
+    opt_tum_output_path_ = outputfilepath + "/slam_pose_traj.txt";
+    livo_tum_before_output_path_ = outputfilepath + "/slam_pose_traj_before_opt.txt";
+    rtk_tum_output_path_ = outputfilepath + "/rtk_pose_traj.txt";
     opt_vel_output_path_ = outputfilepath + "/vel/opt_vel.txt";
     gps_vel_output_path_ = outputfilepath + "/vel/gps_vel.txt";
     global_map_pcd_path_ = std::string(ROOT_DIR) + "Log/pcd/";
@@ -312,10 +313,29 @@ optimization::optimization(ros::NodeHandle &nh)
     if (!outputfilepath.empty()) {
         ensureDirectory(debug_optdata_path_);
         ensureDirectory(debug_optdata_path_ + "pcd/");
-        ensureDirectory(outputfilepath + "/TUM/");
+        ensureDirectory(outputfilepath + "/");
         ensureDirectory(outputfilepath + "/vel/");
         ensureDirectory(global_map_pcd_path_);
         ensureDirectory(keyframe_scan_pcd_path_);
+    }
+
+    if (!opt_en || localization_en) {
+        if (!opt_en && !localization_en && !outputfilepath.empty()) {
+            record_frontend_logs_ = true;
+            nh.param<bool>("pcd_save/save_map_before_opt", save_map_before_opt_, false);
+            openFrontendLogs();
+            nh.param<string>("gps/gps_topic", gps_topic, "/ublox_driver/receiver_lla");
+            nh.param<double>("gps/gps_time_offset", gps_offset, 0.0);
+            sub_frontend_odom_ = nh.subscribe<nav_msgs::Odometry>(
+                "/odometry/fast_livo2", 200, &optimization::frontendOdomHandler, this);
+            subGPS_pvt = nh.subscribe<gnss_comm::GnssPVTSolnMsg>(
+                gps_topic, 200, &optimization::gpsHandler, this);
+            ROS_INFO("Optimization disabled. Recording frontend trajectory to %s/TUM and %s/vel.",
+                     outputfilepath.c_str(), outputfilepath.c_str());
+        } else {
+            ROS_INFO("Optimization mode: [OFFLINE] disabled due to localization mode or opt_enable=false.");
+        }
+        return;
     }
 
     nh.param<string>("gps/gps_topic", gps_topic, "/ublox_driver/receiver_lla");
@@ -328,6 +348,10 @@ optimization::optimization(ros::NodeHandle &nh)
     nh.param<double>("opt/livo2_RPY_cov", livo2_RPY_cov, 1e-4);
     nh.param<double>("opt/livo2_XYZ_cov", livo2_XYZ_cov, 1e-4);
     nh.param<double>("opt/map_voxel_size", map_voxel_size_, 0.10);
+    nh.param<bool>("pcd_save/dense_map_en", dense_map_en_, false);
+    nh.param<bool>("pcd_save/save_map_before_opt", save_map_before_opt_, false);
+    if (map_voxel_size_ < 0.05) map_voxel_size_ = 0.05;
+    nh.param<bool>("opt/sliding_window_en", sliding_window_en_, true);
     nh.param<double>("opt/smoother_lag", smoother_lag_, 10.0);
     nh.param<double>("opt/align_duration", align_duration_, 50.0);
     if (smoother_lag_ < 0.5) smoother_lag_ = 0.5;
@@ -356,9 +380,14 @@ optimization::optimization(ros::NodeHandle &nh)
     }
     last_keyframe_wall_time_ = ros::WallTime::now();
 
-    ROS_INFO("Optimization mode: [SLIDING WINDOW]. lag=%.1f s, align=%.1f s.",
-             smoother_lag_, align_duration_);
-    optimization_thread_ = std::thread(&optimization::offlineOptimizationTask, this);
+    if (sliding_window_en_) {
+        ROS_INFO("Optimization mode: [SLIDING WINDOW]. lag=%.1f s, align=%.1f s.",
+                 smoother_lag_, align_duration_);
+        optimization_thread_ = std::thread(&optimization::offlineOptimizationTask, this);
+    } else {
+        ROS_INFO("Optimization mode: [OFFLINE]. Press Enter for one full-trajectory batch optimization.");
+        optimization_thread_ = std::thread(&optimization::batchOptimizationTask, this);
+    }
     
 }
 
@@ -368,6 +397,7 @@ optimization::~optimization()
     if (optimization_thread_.joinable()) {
         optimization_thread_.join();
     }
+    closeFrontendLogs();
 }
 
 namespace {
@@ -375,6 +405,44 @@ bool bufferIdle(const ros::WallTime& last_message_time, size_t keyframe_count, d
 {
     if (keyframe_count == 0) return false;
     return (ros::WallTime::now() - last_message_time).toSec() >= idle_seconds;
+}
+
+// Returns true after Enter. With no stdin (roslaunch), returns true immediately so
+// the caller can start once the keyframe buffer goes idle. Returns false on shutdown.
+bool waitForOptimizationTrigger(const std::atomic_bool& shutdown_requested)
+{
+    while (ros::ok() && !shutdown_requested.load(std::memory_order_relaxed)) {
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(STDIN_FILENO, &read_set);
+
+        timeval timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;
+
+        const int rc = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ROS_WARN("[Offline Optimization] stdin wait failed, falling back to auto-trigger.");
+            return true;
+        }
+        if (rc == 0 || !FD_ISSET(STDIN_FILENO, &read_set)) {
+            continue;
+        }
+
+        char ch = '\0';
+        const ssize_t nread = ::read(STDIN_FILENO, &ch, 1);
+        if (nread <= 0) {
+            ROS_INFO("[Offline Optimization] stdin unavailable, optimization starts once keyframes are idle.");
+            return true;
+        }
+        if (ch == '\n') {
+            return true;
+        }
+    }
+    return false;
 }
 } // namespace
 
@@ -616,6 +684,9 @@ void optimization::commitKey(size_t index, const gtsam::Pose3& antenna_pose)
         if (index >= keyFrames.size()) return;
         cloud = keyFrames[index].cloud;
         time = keyFrames[index].time;
+        // Drop the keyframe pointer before releasing the lock so the cache
+        // cap cannot spill the same scan a second time.
+        keyFrames[index].cloud.reset();
     }
 
     const gtsam::Pose3 imu_pose = antenna_pose.compose(T_imu_rtk.inverse());
@@ -632,10 +703,6 @@ void optimization::commitKey(size_t index, const gtsam::Pose3& antenna_pose)
         }
         key_committed_[index] = 1;
         keyFrames[index].cloud.reset();
-    }
-    if (++map_commits_since_flush_ >= 20) {
-        flushMapHeader(false);
-        map_commits_since_flush_ = 0;
     }
 }
 
@@ -658,6 +725,8 @@ void optimization::finalizeSlidingWindow(const gtsam::Values& window_estimate)
     }
     is_optimized = true;
     saveCommittedGlobalMap();
+    writeBeforeOptTrajectory();
+    writeTimeAlignedRtkFile();
     ROS_INFO("[SlidingWindow] finished. Committed %zu keyframes, map has %zu points.",
              fed_count_, map_points_written_);
 }
@@ -681,14 +750,21 @@ void optimization::appendTumPose(double time, const gtsam::Pose3& imu_pose)
                 << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
 }
 
-bool optimization::ensureMapStream()
+bool optimization::ensureMapStream(std::fstream& stream, const std::string& path, std::streamoff& width_pos,
+                                   std::streamoff& points_pos, size_t& points_written, bool& header_ready)
 {
-    if (map_stream_.is_open()) return true;
-    const std::string path = global_map_pcd_path_ + "after_optimization_downsampled.pcd";
-    map_stream_.open(path.c_str(), std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!map_stream_.is_open()) {
+    if (stream.is_open()) return true;
+    const auto mode = header_ready
+        ? (std::ios::in | std::ios::out | std::ios::binary)
+        : (std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    stream.open(path.c_str(), mode);
+    if (!stream.is_open()) {
         ROS_WARN("[SlidingWindow] failed to open %s", path.c_str());
         return false;
+    }
+    if (header_ready) {
+        stream.seekp(0, std::ios::end);
+        return stream.good();
     }
 
     std::string header;
@@ -699,30 +775,56 @@ bool optimization::ensureMapStream()
     header += "TYPE F F F F\n";
     header += "COUNT 1 1 1 1\n";
     header += "WIDTH ";
-    map_width_pos_ = static_cast<std::streamoff>(header.size());
+    width_pos = static_cast<std::streamoff>(header.size());
     header += "0000000000\n";
     header += "HEIGHT 1\n";
     header += "VIEWPOINT 0 0 0 1 0 0 0\n";
     header += "POINTS ";
-    map_points_pos_ = static_cast<std::streamoff>(header.size());
+    points_pos = static_cast<std::streamoff>(header.size());
     header += "0000000000\n";
     header += "DATA binary\n";
-    map_stream_.write(header.data(), static_cast<std::streamsize>(header.size()));
-    map_points_written_ = 0;
-    return map_stream_.good();
+    stream.write(header.data(), static_cast<std::streamsize>(header.size()));
+    points_written = 0;
+    header_ready = stream.good();
+    return header_ready;
 }
 
 void optimization::appendCommittedCloud(const PointCloudXYZRGB::Ptr& cloud, const gtsam::Pose3& imu_pose)
 {
     if (!cloud || cloud->empty()) return;
-    if (!ensureMapStream()) return;
+    const std::string downsampled_path = global_map_pcd_path_ + "cloud_map.pcd";
+    if (!ensureMapStream(map_stream_, downsampled_path, map_width_pos_, map_points_pos_,
+                         map_points_written_, map_header_ready_)) {
+        return;
+    }
+    const std::string dense_path = global_map_pcd_path_ + "cloud_map_dense.pcd";
+    const bool write_dense = dense_map_en_ &&
+        ensureMapStream(dense_map_stream_, dense_path, dense_map_width_pos_, dense_map_points_pos_,
+                        dense_map_points_written_, dense_map_header_ready_);
+
     PointCloudXYZRGB transformed;
     pcl::transformPointCloud(*cloud, transformed, poseToAffine3f(imu_pose));
+    const double inv_leaf = 1.0 / map_voxel_size_;
     for (const auto& pt : transformed.points) {
         if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
         const float record[4] = {pt.x, pt.y, pt.z, pt.rgb};
+        if (write_dense) {
+            dense_map_stream_.write(reinterpret_cast<const char*>(record), sizeof(record));
+            ++dense_map_points_written_;
+        }
+        const MapVoxelKey key{static_cast<int>(std::floor(pt.x * inv_leaf)),
+                              static_cast<int>(std::floor(pt.y * inv_leaf)),
+                              static_cast<int>(std::floor(pt.z * inv_leaf))};
+        if (!optimized_voxels_.insert(key).second) continue;
         map_stream_.write(reinterpret_cast<const char*>(record), sizeof(record));
         ++map_points_written_;
+    }
+    // Close after every committed scan so the PCD header matches the bytes on disk
+    // and an external viewer can reload the map while mapping is still running.
+    flushMapHeader(map_stream_, map_width_pos_, map_points_pos_, map_points_written_, true);
+    if (write_dense) {
+        flushMapHeader(dense_map_stream_, dense_map_width_pos_, dense_map_points_pos_,
+                       dense_map_points_written_, true);
     }
 }
 
@@ -751,43 +853,45 @@ void optimization::writeInitMapPose(double time, const gtsam::Pose3& imu_pose)
              path.c_str(), t.x(), t.y(), t.z(), yaw);
 }
 
-void optimization::flushMapHeader(bool close_stream)
+void optimization::flushMapHeader(std::fstream& stream, std::streamoff width_pos, std::streamoff points_pos,
+                                  size_t points_written, bool close_stream)
 {
-    if (!map_stream_.is_open()) {
-        if (close_stream) {
-            ROS_WARN("[SlidingWindow] no committed points to save.");
-        }
+    if (!stream.is_open()) return;
+    char digits[16];
+    std::snprintf(digits, sizeof(digits), "%010zu", points_written);
+    stream.seekp(width_pos);
+    stream.write(digits, 10);
+    stream.seekp(points_pos);
+    stream.write(digits, 10);
+    stream.flush();
+    if (!close_stream) {
+        stream.seekp(0, std::ios::end);
         return;
     }
-    char digits[16];
-    std::snprintf(digits, sizeof(digits), "%010zu", map_points_written_);
-    const auto end_pos = map_stream_.tellp();
-    map_stream_.seekp(map_width_pos_);
-    map_stream_.write(digits, 10);
-    map_stream_.seekp(map_points_pos_);
-    map_stream_.write(digits, 10);
-    if (!close_stream) {
-        map_stream_.seekp(end_pos);
-    }
-    map_stream_.flush();
-    map_commits_since_flush_ = 0;
-    if (!close_stream) return;
-    map_stream_.close();
-    std::cout << "[SlidingWindow] Saved map (" << map_points_written_
-              << " points) to " << global_map_pcd_path_
-              << "after_optimization_downsampled.pcd" << std::endl;
+    stream.close();
 }
 
 void optimization::saveCommittedGlobalMap()
 {
-    flushMapHeader(true);
+    flushMapHeader(map_stream_, map_width_pos_, map_points_pos_, map_points_written_, true);
+    if (dense_map_en_) {
+        flushMapHeader(dense_map_stream_, dense_map_width_pos_, dense_map_points_pos_,
+                       dense_map_points_written_, true);
+    }
+    std::cout << "[SlidingWindow] Saved downsampled map (" << map_points_written_
+              << " points, voxel " << map_voxel_size_ << " m) to " << global_map_pcd_path_
+              << "cloud_map.pcd" << std::endl;
+    if (dense_map_en_) {
+        std::cout << "[SlidingWindow] Saved dense map (" << dense_map_points_written_
+                  << " points) to " << global_map_pcd_path_ << "cloud_map_dense.pcd" << std::endl;
+    }
 }
 
 void optimization::waitForKeyFrameIdle(double idle_seconds)
 {
     const ros::WallDuration idle_duration(idle_seconds);
     size_t last_count = 0;
-    while (ros::ok()) {
+    while (ros::ok() && !optimization_shutdown_requested_.load(std::memory_order_relaxed)) {
         size_t current_count = 0;
         ros::WallTime last_keyframe_time;
         {
@@ -825,7 +929,7 @@ void optimization::saveKeyFrameAndFactor(const gtsam::Pose3& pose,
                                          const Eigen::Vector3d& velocity,
                                          const PointCloudXYZRGB::Ptr& cloud)
 {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     if (!accepting_keyframes_) {
         return;
     }
@@ -837,6 +941,21 @@ void optimization::saveKeyFrameAndFactor(const gtsam::Pose3& pose,
     keyframe.time = time;
     keyframe.pose = pose;
     keyframe.velocity = velocity;
+    TimedSample before_pose;
+    before_pose.t = time;
+    before_pose.x = pose.translation().x();
+    before_pose.y = pose.translation().y();
+    before_pose.z = pose.translation().z();
+    const auto before_q = pose.rotation().toQuaternion();
+    before_pose.qx = before_q.x();
+    before_pose.qy = before_q.y();
+    before_pose.qz = before_q.z();
+    before_pose.qw = before_q.w();
+    before_pose.vx = velocity.x();
+    before_pose.vy = velocity.y();
+    before_pose.vz = velocity.z();
+    before_opt_poses_.push_back(before_pose);
+    slam_pose_samples_.push_back(before_pose);
     keyframe.cloud.reset(new PointCloudXYZRGB());
     if (cloud && !cloud->empty()) {
         if (map_voxel_size_ > 0.0) {
@@ -854,26 +973,142 @@ void optimization::saveKeyFrameAndFactor(const gtsam::Pose3& pose,
     }
 
     keyFrames.push_back(keyframe);
-    // Pose-graph clouds are only needed until the fixed-lag window commits them.
-    // If optimization falls behind, drop the oldest scans instead of growing RAM.
-    constexpr size_t kMaxCachedKeyframeClouds = 80;
-    size_t cached = 0;
-    for (const auto& frame : keyFrames) {
-        if (frame.cloud && !frame.cloud->empty()) ++cached;
-    }
-    if (cached > kMaxCachedKeyframeClouds) {
-        size_t extra = cached - kMaxCachedKeyframeClouds;
-        for (auto& frame : keyFrames) {
-            if (extra == 0) break;
-            if (frame.cloud && !frame.cloud->empty()) {
+    // Sliding-window clouds are only needed until the window commits them.
+    // Batch mode keeps every scan; dropping one would leave a hole in the full map.
+    // Once the cache is past the cap, spill the oldest clouds to the map with the
+    // pose known so far. Discarding them made after_optimization_downsampled.pcd
+    // contain only the scans that were still in memory at commit time.
+    std::vector<std::pair<PointCloudXYZRGB::Ptr, gtsam::Pose3>> spilled;
+    if (sliding_window_en_ && (map_frame_aligned_ || odom_only_)) {
+        constexpr size_t kMaxCachedKeyframeClouds = 80;
+        size_t cached = 0;
+        for (const auto& frame : keyFrames) {
+            if (frame.cloud && !frame.cloud->empty()) ++cached;
+        }
+        if (cached > kMaxCachedKeyframeClouds) {
+            size_t extra = cached - kMaxCachedKeyframeClouds;
+            for (auto& frame : keyFrames) {
+                if (extra == 0) break;
+                if (!frame.cloud || frame.cloud->empty()) continue;
+                gtsam::Pose3 imu_pose = frame.pose;
+                if (map_frame_aligned_) {
+                    imu_pose = T_enu_slam_.compose(imu_pose);
+                }
+                spilled.emplace_back(frame.cloud, imu_pose);
                 frame.cloud.reset();
                 --extra;
             }
+            ROS_WARN_THROTTLE(5.0, "[SlidingWindow] keyframe cloud cache capped at %zu scans; spilled oldest clouds to the map.",
+                              kMaxCachedKeyframeClouds);
         }
-        ROS_WARN_THROTTLE(5.0, "[SlidingWindow] keyframe cloud cache capped at %zu scans.",
-                          kMaxCachedKeyframeClouds);
     }
     last_keyframe_wall_time_ = ros::WallTime::now();
+    lock.unlock();
+    for (const auto& item : spilled) {
+        appendCommittedCloud(item.first, item.second);
+    }
+}
+
+void optimization::batchOptimizationTask()
+{
+    if (!waitForOptimizationTrigger(optimization_shutdown_requested_)) {
+        return;
+    }
+    waitForKeyFrameIdle(3.0);
+    if (!ros::ok() || optimization_shutdown_requested_.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        accepting_keyframes_ = false;
+    }
+
+    ROS_INFO("[Offline Optimization] Starting batch optimization...");
+    if (!initialAlign()) {
+        ROS_WARN("[Offline Optimization] alignment failed, skipping batch LM.");
+        writeBeforeOptTrajectory();
+        writeTimeAlignedRtkFile();
+        return;
+    }
+
+    // initialAlign() leaves keyframes in the SLAM frame. GPS factors are ENU,
+    // so the batch graph needs antenna poses in that frame. The sliding window
+    // applies T_enu_slam_ per frame and must not see this rewrite.
+    writeBeforeOptTrajectory();
+    writeTimeAlignedRtkFile();
+    rewritePosesToEnuAntenna();
+    ROS_INFO("[Offline Optimization] Saved pre-optimization trajectory.");
+
+    size_t pose_count = 0;
+    size_t gps_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        pose_count = initialEstimate.size();
+        gps_count = gpsQueue_B.size();
+    }
+    if (pose_count == 0 || gps_count != pose_count) {
+        ROS_WARN("[Offline Optimization] GPS/keyframe size mismatch (%zu vs %zu), skipping LM.",
+                 gps_count, pose_count);
+        return;
+    }
+
+    gtsam::LevenbergMarquardtParams params;
+    // Serial solver avoids the TBB heap corruption seen when GTSAM's threaded
+    // Cholesky runs next to ROS/PCL allocators.
+    params.linearSolverType = gtsam::LevenbergMarquardtParams::SEQUENTIAL_CHOLESKY;
+    params.setMaxIterations(500);
+    params.setRelativeErrorTol(1e-9);
+    params.setAbsoluteErrorTol(1e-9);
+
+    ROS_INFO("[Offline Optimization] Building batch graph... (keyframes: %zu, gpsQueue_B: %zu)",
+             pose_count, gps_count);
+    buildBatchGraph();
+    ROS_INFO("[Offline Optimization] Graph built with %zu factors. Starting LM optimization...",
+             gtSAMgraph.size());
+
+    gtsam::Values result;
+    try {
+        gtsam::LevenbergMarquardtOptimizer optimizer(gtSAMgraph, initialEstimate, params);
+        result = optimizer.optimize();
+    } catch (const std::exception& e) {
+        ROS_ERROR("[Offline Optimization] LM optimization failed: %s", e.what());
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (result.size() != keyFrames.size()) {
+            ROS_WARN("[Offline Optimization] optimized pose count %zu != keyframes %zu.",
+                     result.size(), keyFrames.size());
+            return;
+        }
+        initialEstimate = result;
+        for (size_t i = 0; i < keyFrames.size(); ++i) {
+            const gtsam::Pose3 antenna_pose = initialEstimate.at<gtsam::Pose3>(i);
+            keyFrames[i].pose = antenna_pose.compose(T_imu_rtk.inverse());
+        }
+    }
+
+    is_optimized = true;
+    writeOptimizedTumTrajectory();
+    if (map_frame_aligned_ && !keyFrames.empty()) {
+        writeInitMapPose(keyFrames.front().time, keyFrames.front().pose);
+    }
+    saveOptimizedGlobalMap();
+    ROS_INFO("[Offline Optimization] Finished.");
+}
+
+void optimization::rewritePosesToEnuAntenna()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    for (size_t i = 0; i < keyFrames.size(); ++i) {
+        const gtsam::Pose3 antenna_enu = T_enu_slam_.compose(keyFrames[i].pose.compose(T_imu_rtk));
+        keyFrames[i].pose = antenna_enu;
+        initialEstimate.update(i, antenna_enu);
+    }
+    ROS_INFO("[Offline Optimization] Rewrote %zu keyframe poses into the ENU antenna frame.",
+             keyFrames.size());
 }
 
 //DTW
@@ -1466,6 +1701,53 @@ void optimization::buildBatchGraph()
     }
 } 
 
+void optimization::openFrontendLogs()
+{
+    auto open_log = [](std::ofstream& stream, const std::string& path, const char* header) {
+        stream.open(path.c_str());
+        if (!stream.is_open()) {
+            ROS_WARN("[FrontendLog] failed to open %s", path.c_str());
+            return;
+        }
+        stream << header << "\n";
+        stream << std::fixed << std::setprecision(6);
+        stream.flush();
+    };
+    open_log(livo_tum_stream_, opt_tum_output_path_, "# timestamp tx ty tz qx qy qz qw");
+}
+
+void optimization::closeFrontendLogs()
+{
+    if (record_frontend_logs_) writeTimeAlignedRtkFile();
+    if (livo_tum_stream_.is_open()) livo_tum_stream_.close();
+}
+
+void optimization::frontendOdomHandler(const nav_msgs::Odometry::ConstPtr& odomMsg)
+{
+    if (!record_frontend_logs_ || !livo_tum_stream_.is_open()) return;
+    const auto& p = odomMsg->pose.pose.position;
+    const auto& q = odomMsg->pose.pose.orientation;
+    const auto& v = odomMsg->twist.twist.linear;
+    const double t = odomMsg->header.stamp.toSec();
+    TimedSample sample;
+    sample.t = t;
+    sample.x = p.x;
+    sample.y = p.y;
+    sample.z = p.z;
+    sample.qx = q.x;
+    sample.qy = q.y;
+    sample.qz = q.z;
+    sample.qw = q.w;
+    sample.vx = v.x;
+    sample.vy = v.y;
+    sample.vz = v.z;
+    slam_pose_samples_.push_back(sample);
+    livo_tum_stream_ << t << " "
+                     << p.x << " " << p.y << " " << p.z << " "
+                     << q.x << " " << q.y << " " << q.z << " " << q.w << "\n";
+    livo_tum_stream_.flush();
+}
+
 void optimization::syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, const sensor_msgs::PointCloud2::ConstPtr& cloudMsg)
 {
     timeLaserInoStamp = cloudMsg->header.stamp;
@@ -1542,7 +1824,25 @@ void optimization::gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
 
     gps_odom.pose.covariance[0]  = gpsMsg->h_acc; 
     gps_odom.pose.covariance[7]  = gpsMsg->h_acc; 
-    gps_odom.pose.covariance[14] = gpsMsg->v_acc; 
+    gps_odom.pose.covariance[14] = gpsMsg->v_acc;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        TimedSample sample;
+        sample.t = stamp.toSec() - gps_offset;
+        sample.x = trans_local_[0];
+        sample.y = trans_local_[1];
+        sample.z = trans_local_[2];
+        sample.qw = 1.0;
+        sample.vx = gpsMsg->vel_e;
+        sample.vy = gpsMsg->vel_n;
+        sample.vz = -gpsMsg->vel_d;
+        rtk_pose_samples_.push_back(sample);
+    }
+
+    if (record_frontend_logs_) {
+        return;
+    }
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -1572,47 +1872,123 @@ void optimization::savekeyframescan()
 
 void optimization::saveOptimizedGlobalMap()
 {
-    PointCloudXYZRGB::Ptr globalMapCloud(new PointCloudXYZRGB());
+    const std::string down_path = global_map_pcd_path_ + "cloud_map.pcd";
+    const std::string dense_path = global_map_pcd_path_ + "cloud_map_dense.pcd";
 
-    for (size_t i = 0; i < keyFrames.size(); ++i)
-    {
-        Eigen::Affine3f transform = poseToAffine3f(keyFrames[i].pose);
-        PointCloudXYZRGB::Ptr original_cloud = keyFrames[i].cloud;
-        PointCloudXYZRGB::Ptr transformed_cloud(new PointCloudXYZRGB());
-        pcl::transformPointCloud(*original_cloud, *transformed_cloud, transform);
-        *globalMapCloud += *transformed_cloud;
-    }
-    
-    // Downsample the aggregated dense map with a configurable voxel size so the
-    // saved map is compact enough for prior-map localization.
-    PointCloudXYZRGB::Ptr downsampled_cloud(new PointCloudXYZRGB());
-    if (map_voxel_size_ > 0.0)
-    {
-        pcl::ApproximateVoxelGrid<PointTypeRGB> voxel_filter;
-        voxel_filter.setInputCloud(globalMapCloud);
-        voxel_filter.setLeafSize(static_cast<float>(map_voxel_size_),
-                                 static_cast<float>(map_voxel_size_),
-                                 static_cast<float>(map_voxel_size_));
-        voxel_filter.filter(*downsampled_cloud);
-    }
-    else
-    {
-        *downsampled_cloud = *globalMapCloud;
+    map_header_ready_ = false;
+    map_points_written_ = 0;
+    optimized_voxels_.clear();
+    if (!ensureMapStream(map_stream_, down_path, map_width_pos_, map_points_pos_,
+                         map_points_written_, map_header_ready_)) {
+        return;
     }
 
-    std::string save_path;
-    if (is_optimized) 
-    {
-        save_path = global_map_pcd_path_ + "after_optimization_downsampled.pcd";
-    } 
-    else
-    {
-        save_path = global_map_pcd_path_ + "before_optimization_downsampled.pcd";
+    dense_map_header_ready_ = false;
+    dense_map_points_written_ = 0;
+    const bool write_dense = dense_map_en_ &&
+        ensureMapStream(dense_map_stream_, dense_path, dense_map_width_pos_, dense_map_points_pos_,
+                        dense_map_points_written_, dense_map_header_ready_);
+
+    const double inv_leaf = 1.0 / map_voxel_size_;
+    size_t input_points = 0;
+    for (const auto& frame : keyFrames) {
+        if (!frame.cloud || frame.cloud->empty()) continue;
+        PointCloudXYZRGB transformed;
+        pcl::transformPointCloud(*frame.cloud, transformed, poseToAffine3f(frame.pose));
+        for (const auto& pt : transformed.points) {
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+            ++input_points;
+            const float record[4] = {pt.x, pt.y, pt.z, pt.rgb};
+            if (write_dense) {
+                dense_map_stream_.write(reinterpret_cast<const char*>(record), sizeof(record));
+                ++dense_map_points_written_;
+            }
+            const MapVoxelKey key{static_cast<int>(std::floor(pt.x * inv_leaf)),
+                                  static_cast<int>(std::floor(pt.y * inv_leaf)),
+                                  static_cast<int>(std::floor(pt.z * inv_leaf))};
+            if (!optimized_voxels_.insert(key).second) continue;
+            map_stream_.write(reinterpret_cast<const char*>(record), sizeof(record));
+            ++map_points_written_;
+        }
     }
-    pcl::io::savePCDFileBinary(save_path, *downsampled_cloud);
-    std::cout << "[Offline Optimization] Saved downsampled map (" << globalMapCloud->size()
-              << " -> " << downsampled_cloud->size() << " points, voxel size "
-              << map_voxel_size_ << " m) to " << save_path << std::endl;
+
+    flushMapHeader(map_stream_, map_width_pos_, map_points_pos_, map_points_written_, true);
+    std::cout << "[Offline Optimization] Saved downsampled map (" << input_points
+              << " -> " << map_points_written_ << " points, voxel "
+              << map_voxel_size_ << " m) to " << down_path << std::endl;
+    if (write_dense) {
+        flushMapHeader(dense_map_stream_, dense_map_width_pos_, dense_map_points_pos_,
+                       dense_map_points_written_, true);
+        std::cout << "[Offline Optimization] Saved dense map (" << dense_map_points_written_
+                  << " points) to " << dense_path << std::endl;
+    }
+}
+
+void optimization::writeBeforeOptTrajectory()
+{
+    if (livo_tum_before_output_path_.empty() || before_opt_poses_.empty()) return;
+    std::ofstream tum_file(livo_tum_before_output_path_);
+    if (!tum_file.is_open()) {
+        ROS_WARN("Failed to open %s", livo_tum_before_output_path_.c_str());
+        return;
+    }
+    tum_file << "# timestamp tx ty tz qx qy qz qw\n";
+    tum_file << std::fixed << std::setprecision(6);
+    for (const auto& sample : before_opt_poses_) {
+        gtsam::Pose3 pose(gtsam::Rot3::Quaternion(sample.qw, sample.qx, sample.qy, sample.qz),
+                          gtsam::Point3(sample.x, sample.y, sample.z));
+        if (map_frame_aligned_) pose = T_enu_slam_.compose(pose);
+        const auto t = pose.translation();
+        const auto q = pose.rotation().toQuaternion();
+        tum_file << sample.t << " "
+                 << t.x() << " " << t.y() << " " << t.z() << " "
+                 << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
+}
+
+void optimization::writeTimeAlignedRtkFile()
+{
+    if (rtk_tum_output_path_.empty() || rtk_pose_samples_.empty()) return;
+    if (!gps_time_shift_applied_ && slam_pose_samples_.size() >= 3 && rtk_pose_samples_.size() >= 3) {
+        std::vector<std::vector<double>> slam_pos, slam_vel, gps_pos, gps_vel;
+        for (const auto& s : slam_pose_samples_) {
+            slam_pos.push_back({s.t, s.x, s.y, s.z});
+            slam_vel.push_back({s.t, s.vx, s.vy, s.vz});
+        }
+        for (const auto& s : rtk_pose_samples_) {
+            gps_pos.push_back({s.t, s.x, s.y, s.z});
+            gps_vel.push_back({s.t, s.vx, s.vy, s.vz});
+        }
+        const double slam_start = slam_pos.front()[0];
+        const double gps_start = gps_pos.front()[0];
+        const double raw_overlap = std::min(slam_pos.back()[0], gps_pos.back()[0]) - std::max(slam_start, gps_start);
+        const bool epoch_mismatch = raw_overlap < 5.0 || std::fabs(slam_start - gps_start) > 100.0;
+        const double coarse = epoch_mismatch ? (slam_start - gps_start) : 0.0;
+        double best_score = 0.0, zero_score = 0.0;
+        int pairs = 0;
+        std::string source;
+        const double fine = estimateVelocityTimeOffset(gps_pos, slam_pos, gps_vel, slam_vel,
+                                                       coarse, best_score, zero_score, pairs, source);
+        gps_time_shift_ = coarse;
+        if (std::isfinite(fine) && std::fabs(fine) <= 10.0 && best_score > 0.25) {
+            gps_time_shift_ += fine;
+        }
+        gps_time_shift_applied_ = true;
+        ROS_INFO("[PoseLog] applied RTK time offset %.6f s (%s).", gps_time_shift_, source.c_str());
+    }
+
+    std::ofstream tum_file(rtk_tum_output_path_);
+    if (!tum_file.is_open()) {
+        ROS_WARN("Failed to open %s", rtk_tum_output_path_.c_str());
+        return;
+    }
+    tum_file << "# timestamp tx ty tz qx qy qz qw\n";
+    tum_file << std::fixed << std::setprecision(6);
+    for (const auto& sample : rtk_pose_samples_) {
+        tum_file << (sample.t + gps_time_shift_) << " "
+                 << sample.x << " " << sample.y << " " << sample.z << " "
+                 << sample.qx << " " << sample.qy << " " << sample.qz << " " << sample.qw << "\n";
+    }
 }
 
 void optimization::writeTumTrajectory(const std::string& path) {

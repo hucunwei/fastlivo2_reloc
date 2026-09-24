@@ -91,6 +91,7 @@ public:
 
     void loadData(const std::string& data_dir);
     void offlineOptimizationTask();
+    void batchOptimizationTask();
     bool initialAlign();
     bool ensureWindowAligned(bool force);
     void feedAvailable(gtsam::Values& previous_estimate);
@@ -102,8 +103,10 @@ public:
     void trimGpsQueue();
     void appendTumPose(double time, const gtsam::Pose3& imu_pose);
     void appendCommittedCloud(const PointCloudXYZRGB::Ptr& cloud, const gtsam::Pose3& imu_pose);
-    bool ensureMapStream();
-    void flushMapHeader(bool close_stream);
+    bool ensureMapStream(std::fstream& stream, const std::string& path, std::streamoff& width_pos,
+                         std::streamoff& points_pos, size_t& points_written, bool& header_ready);
+    void flushMapHeader(std::fstream& stream, std::streamoff width_pos, std::streamoff points_pos,
+                        size_t points_written, bool close_stream);
     void writeInitMapPose(double time, const gtsam::Pose3& imu_pose);
     void saveCommittedGlobalMap();
     double calculateDtwTimeOffset(const std::vector<std::vector<double>>& gpsdata, const std::vector<std::vector<double>>& slamdata);
@@ -124,6 +127,9 @@ public:
                                const PointCloudXYZRGB::Ptr& cloud);
     bool keyframeMotionEnough(const gtsam::Pose3 &pose) const;
     void syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, const sensor_msgs::PointCloud2::ConstPtr& cloudMsg);
+    void frontendOdomHandler(const nav_msgs::Odometry::ConstPtr& odomMsg);
+    void openFrontendLogs();
+    void closeFrontendLogs();
     void gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& pvtMsg);
     // void gpsHandler(const sensor_msgs::NavSatFixConstPtr& gpsMsg);
 
@@ -131,7 +137,11 @@ public:
     void savekeyframescan();
     void writeTumTrajectory(const std::string& path);
     void writeOptimizedTumTrajectory();
+    void writeBeforeOptTrajectory();
+    void appendLidarPose(double time, const gtsam::Pose3& imu_pose);
+    gtsam::Pose3 imuToLidarPose(const gtsam::Pose3& imu_pose) const;
     void writeRtkTumTrajectory();
+    void writeTimeAlignedRtkFile();
     
     template<typename T>
     void publishCloud(const ros::Publisher& pub, const T& cloud, const ros::Time& stamp, const std::string& frame_id)
@@ -146,6 +156,7 @@ public:
 public:
     ros::Subscriber subGPS;
     ros::Subscriber subGPS_pvt;
+    ros::Subscriber sub_frontend_odom_;
 
     ros::Publisher pubGpsOdom;
 
@@ -158,6 +169,9 @@ public:
     gtsam::Values initialEstimate;        
     gtsam::Values isamCurrentEstimate;
     gtsam::Values optimizedEstimate;
+
+    // true: fixed-lag smoother while mapping. false: one full-trajectory LM after Enter.
+    bool sliding_window_en_ = true;
 
     // Fixed-lag smoother. Only the recent smoother_lag_ seconds stay in the graph.
     // Older poses are marginalized and their clouds are released.
@@ -179,13 +193,25 @@ public:
     PointCloudXYZRGB::Ptr optimized_map_;
     std::unordered_set<MapVoxelKey, MapVoxelKeyHash> optimized_voxels_;
     std::ofstream tum_stream_;
+    std::ofstream livo_tum_stream_;
+    std::ofstream rtk_tum_stream_;
+    std::ofstream slam_vel_stream_;
+    std::ofstream gps_vel_stream_;
+    bool record_frontend_logs_ = false;
     std::fstream map_stream_;
     std::streamoff map_width_pos_ = 0;
     std::streamoff map_points_pos_ = 0;
     size_t map_points_written_ = 0;
-    int map_commits_since_flush_ = 0;
+    bool map_header_ready_ = false;
+    std::fstream dense_map_stream_;
+    std::streamoff dense_map_width_pos_ = 0;
+    std::streamoff dense_map_points_pos_ = 0;
+    size_t dense_map_points_written_ = 0;
+    bool dense_map_header_ready_ = false;
+    bool dense_map_en_ = false;
     
     gtsam::Pose3 T_imu_rtk;
+    gtsam::Pose3 T_imu_lidar_;
 
 
     KeyFrameVector keyFrames;
@@ -233,6 +259,16 @@ public:
     string opt_tum_output_path_;
     string livo_tum_before_output_path_;
     string rtk_tum_output_path_;
+    bool save_map_before_opt_ = false;
+    struct TimedSample {
+        double t = 0.0;
+        double x = 0.0, y = 0.0, z = 0.0;
+        double qx = 0.0, qy = 0.0, qz = 0.0, qw = 1.0;
+        double vx = 0.0, vy = 0.0, vz = 0.0;
+    };
+    std::vector<TimedSample> before_opt_poses_;
+    std::vector<TimedSample> slam_pose_samples_;
+    std::vector<TimedSample> rtk_pose_samples_;
     string opt_vel_output_path_;
     string gps_vel_output_path_;
     string global_map_pcd_path_;
@@ -240,6 +276,9 @@ public:
     std::string pcd_save_directory_;
 
 private:
+    // Batch mode only. Sliding-window keyframes must stay in the SLAM frame.
+    void rewritePosesToEnuAntenna();
+
     std::mutex mutex;
     std::unique_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
 };

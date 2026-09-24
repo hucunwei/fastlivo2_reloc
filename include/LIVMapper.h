@@ -67,10 +67,14 @@ public:
   void handleRTK();
   void savePCD();
   void mergeCloudChunks();
-  bool ensureOnlineMapStream(bool rgb);
+  bool ensureOnlineMapStream(std::fstream &stream, const std::string &path, bool rgb,
+                             std::streamoff &width_pos, std::streamoff &points_pos,
+                             size_t &points_written, bool &header_ready);
   void appendOnlineMapCloud(const PointCloudXYZRGB::Ptr &cloud);
   void appendOnlineMapCloud(const PointCloudXYZI::Ptr &cloud);
-  void flushOnlineMapHeader(bool close_stream);
+  void flushOnlineMapHeader(std::fstream &stream, std::streamoff width_pos, std::streamoff points_pos,
+                            size_t points_written, bool close_stream);
+  void flushOnlineMaps(bool close_stream);
   void appendUniqueMapCloud(const PointCloudXYZRGB::Ptr &cloud);
   void appendUniqueMapCloud(const PointCloudXYZI::Ptr &cloud);
   void saveMap();
@@ -99,6 +103,8 @@ public:
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
   void publish_odometry(const ros::Publisher &pubOdomAftMapped);
+  void publishBodyTf(const ros::Time &stamp);
+  void bodyTfTimerCallback(const ros::TimerEvent &e);
   void publish_mavros(const ros::Publisher &mavros_pose_publisher);
   void publish_path(const ros::Publisher pubPath);
   void readParameters(ros::NodeHandle &nh);
@@ -130,6 +136,9 @@ public:
   double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 
   bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
+  bool opt_enable_ = false;
+  bool save_dense_map_ = false;
+  bool save_map_before_opt_ = false;
   int img_save_interval = 1, pcd_save_interval = -1, pcd_save_type = 0;
   int pub_scan_num = 1;
 
@@ -195,7 +204,13 @@ public:
   std::streamoff online_map_width_pos_ = 0;
   std::streamoff online_map_points_pos_ = 0;
   size_t online_map_points_written_ = 0;
-  int online_map_frames_since_flush_ = 0;
+  bool online_map_header_ready_ = false;
+  std::fstream dense_map_stream_;
+  std::string dense_map_pcd_path_;
+  std::streamoff dense_map_width_pos_ = 0;
+  std::streamoff dense_map_points_pos_ = 0;
+  size_t dense_map_points_written_ = 0;
+  bool dense_map_header_ready_ = false;
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 
@@ -235,6 +250,7 @@ public:
   image_transport::Publisher pubImage;
   ros::Publisher mavros_pose_publisher;
   ros::Timer imu_prop_timer;
+  ros::Timer body_tf_timer_;
 
   int frame_num = 0;
   double aver_time_consu = 0;

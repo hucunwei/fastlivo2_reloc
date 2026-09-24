@@ -56,7 +56,18 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
 
 LIVMapper::~LIVMapper()
 {
-  flushOnlineMapHeader(true);
+  if (opt_enable_ && !save_map_before_opt_) return;
+  flushOnlineMaps(true);
+  if (online_map_points_written_ > 0)
+  {
+    std::cout << GREEN << "Downsampled point cloud data saved to: " << online_map_pcd_path_
+              << " with point count: " << online_map_points_written_ << RESET << std::endl;
+  }
+  if (save_dense_map_ && dense_map_points_written_ > 0)
+  {
+    std::cout << GREEN << "Dense point cloud data saved to: " << dense_map_pcd_path_
+              << " with point count: " << dense_map_points_written_ << RESET << std::endl;
+  }
 }
 
 
@@ -125,6 +136,9 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
 
   nh.param<bool>("pcd_save/colmap_output_en", colmap_output_en, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
+  nh.param<bool>("opt/opt_enable", opt_enable_, false);
+  nh.param<bool>("pcd_save/dense_map_en", save_dense_map_, false);
+  nh.param<bool>("pcd_save/save_map_before_opt", save_map_before_opt_, false);
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
   nh.param<vector<double>>("extrin_calib/Pcl", cameraextrinT, vector<double>());
@@ -255,6 +269,7 @@ bool LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubImage = it.advertise("/rgb_img", 1);
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
+  body_tf_timer_ = nh.createTimer(ros::Duration(0.02), &LIVMapper::bodyTfTimerCallback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
 
   // RTK-GNSS fusion: subscribe GPS topic and publish fused odometry (only when gps_en)
@@ -639,16 +654,24 @@ void LIVMapper::mergeCloudChunks()
   }
 }
 
-bool LIVMapper::ensureOnlineMapStream(bool rgb)
+bool LIVMapper::ensureOnlineMapStream(std::fstream &stream, const std::string &path, bool rgb,
+                                     std::streamoff &width_pos, std::streamoff &points_pos,
+                                     size_t &points_written, bool &header_ready)
 {
-  if (online_map_stream_.is_open()) return true;
-  online_map_pcd_path_ = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
-  online_map_stream_.open(online_map_pcd_path_.c_str(),
-                          std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
-  if (!online_map_stream_.is_open())
+  if (stream.is_open()) return true;
+  const auto mode = header_ready
+      ? (std::ios::in | std::ios::out | std::ios::binary)
+      : (std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+  stream.open(path.c_str(), mode);
+  if (!stream.is_open())
   {
-    ROS_WARN("[MapSave] failed to open %s", online_map_pcd_path_.c_str());
+    ROS_WARN("[MapSave] failed to open %s", path.c_str());
     return false;
+  }
+  if (header_ready)
+  {
+    stream.seekp(0, std::ios::end);
+    return stream.good();
   }
 
   std::string header;
@@ -659,37 +682,52 @@ bool LIVMapper::ensureOnlineMapStream(bool rgb)
   header += "TYPE F F F F\n";
   header += "COUNT 1 1 1 1\n";
   header += "WIDTH ";
-  online_map_width_pos_ = static_cast<std::streamoff>(header.size());
+  width_pos = static_cast<std::streamoff>(header.size());
   header += "0000000000\n";
   header += "HEIGHT 1\n";
   header += "VIEWPOINT 0 0 0 1 0 0 0\n";
   header += "POINTS ";
-  online_map_points_pos_ = static_cast<std::streamoff>(header.size());
+  points_pos = static_cast<std::streamoff>(header.size());
   header += "0000000000\n";
   header += "DATA binary\n";
-  online_map_stream_.write(header.data(), static_cast<std::streamsize>(header.size()));
-  online_map_points_written_ = 0;
-  online_map_frames_since_flush_ = 0;
-  return online_map_stream_.good();
+  stream.write(header.data(), static_cast<std::streamsize>(header.size()));
+  points_written = 0;
+  header_ready = stream.good();
+  if (header_ready)
+  {
+    ROS_INFO("[MapSave] opt_enable=false, streaming map to %s", path.c_str());
+  }
+  return header_ready;
 }
 
-void LIVMapper::flushOnlineMapHeader(bool close_stream)
+void LIVMapper::flushOnlineMapHeader(std::fstream &stream, std::streamoff width_pos, std::streamoff points_pos,
+                                    size_t points_written, bool close_stream)
 {
-  if (!online_map_stream_.is_open()) return;
+  if (!stream.is_open()) return;
   char digits[16];
-  std::snprintf(digits, sizeof(digits), "%010zu", online_map_points_written_);
-  const auto end_pos = online_map_stream_.tellp();
-  online_map_stream_.seekp(online_map_width_pos_);
-  online_map_stream_.write(digits, 10);
-  online_map_stream_.seekp(online_map_points_pos_);
-  online_map_stream_.write(digits, 10);
-  if (!close_stream) online_map_stream_.seekp(end_pos);
-  online_map_stream_.flush();
-  online_map_frames_since_flush_ = 0;
-  if (!close_stream) return;
-  online_map_stream_.close();
-  std::cout << GREEN << "Downsampled point cloud data saved to: " << online_map_pcd_path_
-            << " with point count: " << online_map_points_written_ << RESET << std::endl;
+  std::snprintf(digits, sizeof(digits), "%010zu", points_written);
+  stream.seekp(width_pos);
+  stream.write(digits, 10);
+  stream.seekp(points_pos);
+  stream.write(digits, 10);
+  stream.flush();
+  if (!close_stream)
+  {
+    stream.seekp(0, std::ios::end);
+    return;
+  }
+  stream.close();
+}
+
+void LIVMapper::flushOnlineMaps(bool close_stream)
+{
+  flushOnlineMapHeader(online_map_stream_, online_map_width_pos_, online_map_points_pos_,
+                       online_map_points_written_, close_stream);
+  if (save_dense_map_)
+  {
+    flushOnlineMapHeader(dense_map_stream_, dense_map_width_pos_, dense_map_points_pos_,
+                         dense_map_points_written_, close_stream);
+  }
 }
 
 void LIVMapper::appendOnlineMapCloud(const PointCloudXYZRGB::Ptr &cloud)
@@ -701,7 +739,18 @@ void LIVMapper::appendOnlineMapCloud(const PointCloudXYZRGB::Ptr &cloud)
   voxel_filter.setInputCloud(cloud);
   voxel_filter.setLeafSize(leaf, leaf, leaf);
   voxel_filter.filter(*filtered);
-  if (filtered->empty() || !ensureOnlineMapStream(true)) return;
+  const char* map_name = opt_enable_ ? "cloud_map_before_opt.pcd" : "cloud_map.pcd";
+  online_map_pcd_path_ = std::string(ROOT_DIR) + "Log/pcd/" + map_name;
+  if (filtered->empty() || !ensureOnlineMapStream(online_map_stream_, online_map_pcd_path_, true,
+                                                  online_map_width_pos_, online_map_points_pos_,
+                                                  online_map_points_written_, online_map_header_ready_)) return;
+
+  const char* dense_name = opt_enable_ ? "cloud_map_before_opt_dense.pcd" : "cloud_map_dense.pcd";
+  dense_map_pcd_path_ = std::string(ROOT_DIR) + "Log/pcd/" + dense_name;
+  const bool write_dense = save_dense_map_ &&
+      ensureOnlineMapStream(dense_map_stream_, dense_map_pcd_path_, true,
+                            dense_map_width_pos_, dense_map_points_pos_,
+                            dense_map_points_written_, dense_map_header_ready_);
 
   const double inv_leaf = 1.0 / static_cast<double>(leaf);
   for (const auto &pt : filtered->points)
@@ -715,7 +764,17 @@ void LIVMapper::appendOnlineMapCloud(const PointCloudXYZRGB::Ptr &cloud)
     online_map_stream_.write(reinterpret_cast<const char *>(record), sizeof(record));
     ++online_map_points_written_;
   }
-  if (++online_map_frames_since_flush_ >= 50) flushOnlineMapHeader(false);
+  if (write_dense)
+  {
+    for (const auto &pt : cloud->points)
+    {
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+      const float record[4] = {pt.x, pt.y, pt.z, pt.rgb};
+      dense_map_stream_.write(reinterpret_cast<const char *>(record), sizeof(record));
+      ++dense_map_points_written_;
+    }
+  }
+  flushOnlineMaps(true);
 }
 
 void LIVMapper::appendOnlineMapCloud(const PointCloudXYZI::Ptr &cloud)
@@ -727,7 +786,18 @@ void LIVMapper::appendOnlineMapCloud(const PointCloudXYZI::Ptr &cloud)
   voxel_filter.setInputCloud(cloud);
   voxel_filter.setLeafSize(leaf, leaf, leaf);
   voxel_filter.filter(*filtered);
-  if (filtered->empty() || !ensureOnlineMapStream(false)) return;
+  const char* map_name = opt_enable_ ? "cloud_map_before_opt.pcd" : "cloud_map.pcd";
+  online_map_pcd_path_ = std::string(ROOT_DIR) + "Log/pcd/" + map_name;
+  if (filtered->empty() || !ensureOnlineMapStream(online_map_stream_, online_map_pcd_path_, false,
+                                                  online_map_width_pos_, online_map_points_pos_,
+                                                  online_map_points_written_, online_map_header_ready_)) return;
+
+  const char* dense_name = opt_enable_ ? "cloud_map_before_opt_dense.pcd" : "cloud_map_dense.pcd";
+  dense_map_pcd_path_ = std::string(ROOT_DIR) + "Log/pcd/" + dense_name;
+  const bool write_dense = save_dense_map_ &&
+      ensureOnlineMapStream(dense_map_stream_, dense_map_pcd_path_, false,
+                            dense_map_width_pos_, dense_map_points_pos_,
+                            dense_map_points_written_, dense_map_header_ready_);
 
   const double inv_leaf = 1.0 / static_cast<double>(leaf);
   for (const auto &pt : filtered->points)
@@ -741,7 +811,17 @@ void LIVMapper::appendOnlineMapCloud(const PointCloudXYZI::Ptr &cloud)
     online_map_stream_.write(reinterpret_cast<const char *>(record), sizeof(record));
     ++online_map_points_written_;
   }
-  if (++online_map_frames_since_flush_ >= 50) flushOnlineMapHeader(false);
+  if (write_dense)
+  {
+    for (const auto &pt : cloud->points)
+    {
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+      const float record[4] = {pt.x, pt.y, pt.z, pt.intensity};
+      dense_map_stream_.write(reinterpret_cast<const char *>(record), sizeof(record));
+      ++dense_map_points_written_;
+    }
+  }
+  flushOnlineMaps(true);
 }
 
 void LIVMapper::savePCD() 
@@ -1248,7 +1328,7 @@ void LIVMapper::run()
 
     stateEstimationAndMapping();
   }
-  flushOnlineMapHeader(true);
+  if (!opt_enable_ || save_map_before_opt_) flushOnlineMaps(true);
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -2125,7 +2205,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   { 
     pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg); 
   }
-  laserCloudmsg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
+  laserCloudmsg.header.stamp = ros::Time::now();
   laserCloudmsg.header.frame_id = "camera_init";
   pubLaserCloudFullRes.publish(laserCloudmsg);
 
@@ -2147,6 +2227,22 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           pointBodyRGB.b = pt_world_rgb.b;
           laserCloudBodyRGB->push_back(pointBodyRGB);
     }
+    if (laserCloudBodyRGB->empty() && pcl_w_wait_pub && !pcl_w_wait_pub->empty()) {
+      laserCloudBodyRGB->reserve(pcl_w_wait_pub->size());
+      for (const auto& pt_world : pcl_w_wait_pub->points) {
+        V3D p_global(pt_world.x, pt_world.y, pt_world.z);
+        V3D p_body = _state.rot_end.transpose() * (p_global - _state.pos_end);
+        PointTypeRGB pointBodyRGB;
+        pointBodyRGB.x = p_body(0);
+        pointBodyRGB.y = p_body(1);
+        pointBodyRGB.z = p_body(2);
+        pointBodyRGB.r = 0;
+        pointBodyRGB.g = 0;
+        pointBodyRGB.b = 0;
+        laserCloudBodyRGB->push_back(pointBodyRGB);
+      }
+    }
+    if (!laserCloudBodyRGB->empty()) {
     sensor_msgs::PointCloud2 laserCloudbodymsg;
     pcl::toROSMsg(*laserCloudBodyRGB, laserCloudbodymsg);
     laserCloudbodymsg.header.stamp = ros::Time(keyframe_time);
@@ -2163,6 +2259,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           pcl::io::savePCDFileBinary(pcd_filename, *laserCloudBodyRGB);
           pcd_file_index++;
       }
+    }
     }
   }
 
@@ -2282,14 +2379,21 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       case 0: /** world frame **/
         if (pcd_save_interval < 0)
         {
-          if (slam_mode_ == LIVO)
+          // Backend writes after_optimization_*.pcd when optimization is on.
+          // With opt_enable=false there is no backend map, so stream the
+          // downsampled online map instead.
+          if (!opt_enable_ || save_map_before_opt_)
           {
-            appendOnlineMapCloud(laserCloudWorldRGB);
+            if (slam_mode_ == LIVO)
+            {
+              appendOnlineMapCloud(laserCloudWorldRGB);
+            }
+            else if (LidarMeasures.lio_vio_flg == LIO || LidarMeasures.lio_vio_flg == LO)
+            {
+              appendOnlineMapCloud(pcl_w_wait_pub);
+            }
           }
-          else if (LidarMeasures.lio_vio_flg == LIO || LidarMeasures.lio_vio_flg == LO)
-          {
-            appendOnlineMapCloud(pcl_w_wait_pub);
-          }
+          break;
         }
         else if (slam_mode_ == LIVO)
         {
@@ -2422,23 +2526,31 @@ template <typename T> void LIVMapper::set_posestamp(T &out)
   out.orientation.w = geoQuat.w;
 }
 
+void LIVMapper::publishBodyTf(const ros::Time &stamp)
+{
+  Eigen::Quaterniond q(_state.rot_end);
+  static tf::TransformBroadcaster br;
+  tf::Transform transform;
+  transform.setOrigin(tf::Vector3(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2)));
+  transform.setRotation(tf::Quaternion(q.x(), q.y(), q.z(), q.w()));
+  br.sendTransform(tf::StampedTransform(transform, stamp, "camera_init", "aft_mapped"));
+  br.sendTransform(tf::StampedTransform(transform, stamp, "camera_init", "body"));
+}
+
+void LIVMapper::bodyTfTimerCallback(const ros::TimerEvent &)
+{
+  const ros::Time stamp = ros::Time::now();
+  publishBodyTf(stamp);
+  publishBodyTf(stamp + ros::Duration(0.05));
+}
+
 void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
   odomAftMapped.header.frame_id = "camera_init";
   odomAftMapped.child_frame_id = "aft_mapped";
-  odomAftMapped.header.stamp = ros::Time::now(); //.ros::Time()fromSec(last_timestamp_lidar);
+  odomAftMapped.header.stamp = ros::Time::now();
   set_posestamp(odomAftMapped.pose.pose);
-
-  static tf::TransformBroadcaster br;
-  tf::Transform transform;
-  tf::Quaternion q;
-  transform.setOrigin(tf::Vector3(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2)));
-  q.setW(geoQuat.w);
-  q.setX(geoQuat.x);
-  q.setY(geoQuat.y);
-  q.setZ(geoQuat.z);
-  transform.setRotation(q);
-  br.sendTransform( tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "aft_mapped") );
+  publishBodyTf(odomAftMapped.header.stamp);
   pubOdomAftMapped.publish(odomAftMapped);
 }
 

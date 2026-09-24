@@ -101,6 +101,8 @@ pcd_save:
   type: 0 # 0: World Frame, 1: Body Frame;
   colmap_output_en: false # need to set interval = -1
   filter_size_pcd: 0.15
+  dense_map_en: false    # true: also save the undownsampled map
+  save_map_before_opt: false  # opt_enable=true: also save cloud_map_before_opt.pcd
   interval: -1
   # how many LiDAR frames saved in each pcd file;
   # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
@@ -115,9 +117,11 @@ gps:
 
 opt:
   opt_enable: true
+  sliding_window_en: true   # false: press Enter during mapping for one full-trajectory batch optimization
   load_data: false
   rtk_cov: 0.05
   livo2_RPY_cov: 0.00000001
   livo2_XYZ_cov: 0.0001
+  map_voxel_size: 0.15   # voxel leaf size [m] for cloud_map.pcd when optimization is on
   smoother_lag: 10.0      # fixed-lag window [s]; older keyframes are marginalized
   align_duration: 50.0    # RTK/SLAM alignment uses the first this many seconds
